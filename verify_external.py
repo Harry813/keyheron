@@ -47,45 +47,29 @@ def make_ca(directory):
             timeout=20,
         )
 
-    openssl(
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        "root.key",
-        "-out",
-        "root.pem",
-        "-subj",
-        "/CN=KeyHeron fixture root",
-        "-days",
-        "2",
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-        "-addext",
-        "keyUsage=critical,keyCertSign,cRLSign",
+    # A machine-wide openssl.cnf may already define CA extensions. An isolated
+    # config avoids duplicate extension OIDs without weakening certificate validation.
+    (directory / "root.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ca\n"
+        "[dn]\nCN=KeyHeron fixture root\n[ca]\nbasicConstraints=critical,CA:TRUE,pathlen:0\n"
+        "keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n"
     )
-    openssl(
-        "req",
-        "-new",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        "server.key",
-        "-out",
-        "server.csr",
-        "-subj",
-        "/CN=localhost",
+    (directory / "leaf.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=localhost\n"
     )
+    openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "root.key")
+    openssl("req", "-x509", "-new", "-sha256", "-key", "root.key", "-config",
+            "root.cnf", "-days", "2", "-out", "root.pem")
+    openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "server.key")
+    openssl("req", "-new", "-sha256", "-key", "server.key", "-config", "leaf.cnf", "-out", "server.csr")
     (directory / "ext").write_text(
         "basicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost\n"
-        "extendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n"
     )
     openssl(
         "x509",
         "-req",
+        "-sha256",
         "-in",
         "server.csr",
         "-CA",
@@ -100,6 +84,7 @@ def make_ca(directory):
         "-extfile",
         "ext",
     )
+    openssl("verify", "-purpose", "sslserver", "-CAfile", "root.pem", "server.pem")
 
 
 class Fixture:
