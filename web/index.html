@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light">
+  <title>KeyHeron（青鹭）· 访问工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#workspace">跳转到工作区</a>
+  <svg xmlns="http://www.w3.org/2000/svg" class="symbols" aria-hidden="true">
+    <symbol id="i-stack" viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4zm0 5l9 4 9-4M3 17l9 4 9-4"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="9" cy="9" r="5"/><path d="M12.5 12.5L21 21m-3-3l2-2m-5-1l2-2"/></symbol>
+    <symbol id="i-log" viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 24 24"><path d="M19.3 8A8 8 0 104 15m16-12v6h-6"/></symbol>
+    <symbol id="i-console" viewBox="0 0 24 24"><path d="M3 5h18v14H3zM7 9l3 3-3 3m6 0h4"/></symbol>
+    <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.6-4 3-6 7-6s6.4 2 7 6"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5l5 5-5 5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l4 4 10-10"/></symbol>
+  </svg>
+  <aside class="rail">
+    <div class="brand"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span><span>KeyHeron · 青鹭</span></div>
+    <nav aria-label="工作台导航">
+      <a href="#environments" class="nav-item current"><svg class="icon"><use href="#i-stack"/></svg>环境访问</a>
+      <a href="#permissions" class="nav-item"><svg class="icon"><use href="#i-key"/></svg>临时授权</a>
+      <a href="#activity" class="nav-item"><svg class="icon"><use href="#i-log"/></svg>操作记录</a>
+    </nav>
+    <div class="identity"><span class="identity-icon"><svg class="icon"><use href="#i-person"/></svg></span><div><strong id="role-name">未连接</strong><small id="role-caption">当前身份</small></div></div>
+  </aside>
+  <main id="workspace" tabindex="-1">
+    <div class="topline"><span class="crumb"><svg class="icon"><use href="#i-console"/></svg>工作区 <span aria-hidden="true">/</span> <b>访问控制</b></span><span class="connection"><i id="connection-dot"></i><span id="sync-state">连接中</span></span></div>
+    <header class="page-head"><div><h1>访问工作台</h1><p>任务 <code id="task-name">—</code></p></div><button id="refresh" class="button secondary"><svg class="icon"><use href="#i-sync"/></svg>刷新</button></header>
+    <p id="message" role="status" hidden></p>
+    <section id="environments" class="panel" aria-labelledby="env-heading">
+      <div class="section-head"><h2 id="env-heading">环境访问</h2><span id="env-context" class="subtle">正在获取会话</span></div>
+      <div class="env-grid" id="env-grid"></div>
+      <div class="session-bar"><div><span class="label">基础权限</span><strong id="base-status">—</strong></div><div><span class="label" id="account-label">最近响应账户</span><code id="last-account">—</code></div><div class="session-actions"><button class="button secondary" id="read" disabled>读取服务状态<svg class="icon"><use href="#i-arrow"/></svg></button><button class="button secondary end-session" id="end" hidden>结束会话</button></div></div>
+    </section>
+    <section id="permissions" class="panel" aria-labelledby="grant-heading">
+      <div class="section-head"><div class="heading-with-count"><h2 id="grant-heading" tabindex="-1">临时授权</h2><span class="count" id="grant-count">0</span></div><button id="request" class="button primary" disabled><span aria-hidden="true">＋</span>申请权限</button></div>
+      <div id="grants" class="grant-list"><p class="empty">正在加载授权申请…</p></div>
+    </section>
+    <section id="activity" class="panel activity" aria-labelledby="event-heading">
+      <div class="section-head"><h2 id="event-heading">操作记录</h2>
+        <label class="filter">环境<select id="event-env"><option value="">全部环境</option></select></label>
+      </div>
+      <div class="table-wrap" role="region" aria-labelledby="event-heading" tabindex="0">
+        <table><thead><tr><th scope="col">时间</th><th scope="col">操作 / 资源</th><th scope="col">环境</th><th scope="col">操作人</th><th scope="col">结果</th><th scope="col">详情</th></tr></thead><tbody id="events"></tbody></table>
+      </div>
+      <div class="list-foot"><span id="event-count" class="subtle">正在加载…</span><button class="button secondary" id="more" hidden>加载更早记录</button></div>
+    </section>
+  </main>
+  <dialog id="modal" aria-labelledby="dialog-title">
+    <form id="modal-form"><h2 id="dialog-title"></h2><div id="dialog-body"></div><div class="dialog-actions"><button class="button secondary" type="button" id="cancel">取消</button><button class="button primary" id="submit" type="submit">确认</button></div></form>
+  </dialog>
+</body></html>

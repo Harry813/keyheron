@@ -1,0 +1,56 @@
+name: Prepare draft release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+    with:
+      stage_binaries: true
+  draft:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tested-*
+          path: ${{ runner.temp }}/native
+          merge-multiple: true
+      - name: Assemble sources, native binaries, metadata and SHA-256 manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/package_release.py --tag "$RELEASE_TAG" --binaries "$RUNNER_TEMP/native" --out "$RUNNER_TEMP/dist"
+      - name: Attest the release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/dist/*
+          create-storage-record: false
+      - name: Create the maintainer's draft
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=(--draft --verify-tag)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/dist/"* "${flags[@]}" --title "$RELEASE_TAG" --generate-notes

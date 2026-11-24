@@ -1,0 +1,95 @@
+{
+  "date": "2026-11-24",
+  "platform": "Darwin arm64",
+  "python": "3.12.7",
+  "keyfence_sha256": "81c792a091d45ce0d67905ce7b00c22e28b30125fa49742800bfc1e81d33cf16",
+  "scenario": {
+    "result": "passed",
+    "implementation": "python-reference",
+    "broker": "KeyFence v0.4.0",
+    "upstreams": "synthetic loopback HTTP",
+    "identity": "trusted test fixtures",
+    "steps": [
+      {
+        "step": "DEV 基础读取",
+        "upstream": "dev-reader"
+      },
+      {
+        "step": "切换 STG 并收回 DEV",
+        "upstream": "stg-reader",
+        "old_dev": 403,
+        "stg_token_at_dev": 403
+      },
+      {
+        "step": "Bob 申请 PROD 被拒，保留自己的 DEV 会话",
+        "upstream": "dev-reader"
+      },
+      {
+        "step": "PROD 默认只读",
+        "upstream": "prod-reader",
+        "diagnostics_before_approval": 403
+      },
+      {
+        "step": "独立审批后临时读取诊断",
+        "approved_by": "owner",
+        "grant": {
+          "actor": "alice",
+          "task": "orders-investigation",
+          "environment": "PROD",
+          "action": "diagnose",
+          "resource": "orders",
+          "seconds_left": 60
+        },
+        "upstream": "prod-diagnostics",
+        "current": {
+          "environment": "PROD",
+          "base": [
+            "read"
+          ],
+          "temporary": [
+            {
+              "action": "diagnose",
+              "resource": "orders",
+              "seconds_left": 60
+            }
+          ]
+        }
+      },
+      {
+        "step": "单独撤销诊断，基础读取继续",
+        "upstream": "prod-reader"
+      },
+      {
+        "step": "一次性重跑 job-4821，并发提交 8 次",
+        "accepted": 1,
+        "refused": 7,
+        "upstream": "prod-worker",
+        "upstream_operations": 1
+      },
+      {
+        "step": "临时权限自然到期",
+        "upstream": "prod-reader",
+        "current": {
+          "environment": "PROD",
+          "base": [
+            "read"
+          ],
+          "temporary": []
+        }
+      },
+      {
+        "step": "切换取消待审和已批授权，任务结束收回剩余会话",
+        "old_task_read": 403
+      }
+    ]
+  },
+  "lifecycle": {
+    "revocation_outage_blocked_switch": true,
+    "concurrent_switch_has_one_live_environment": true,
+    "lost_reply_reconciled_without_repeating_operation": true,
+    "old_token_rejected_after_restart": true,
+    "controller_abrupt_exit_closed_all_brokers_and_removed_temporary_material": true
+  },
+  "interactive_transcript_checked": true,
+  "scope": "单机、同一 OS 用户、模拟身份、回环 HTTP、合成密钥；未接真实业务环境。"
+}

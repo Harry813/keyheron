@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "task": "repository-inspection",
+  "identities": {"applicant": "developer", "approver": "reviewer"},
+  "environments": {
+    "DEV": {
+      "origin": "https://api.github.com",
+      "credential_files": {"github-reader": "./secrets/dev-reader"},
+      "routes": {"read": {
+        "method": "GET", "path": "/repos/YOUR-ORG/YOUR-DEV-REPO/readme",
+        "credential": "github-reader", "resource": "development-repository-readme", "max_ttl": 300
+      }}
+    },
+    "STG": {
+      "origin": "https://api.github.com",
+      "credential_files": {"github-reader": "./secrets/stg-reader"},
+      "routes": {"read": {
+        "method": "GET", "path": "/repos/YOUR-ORG/YOUR-STG-REPO/readme",
+        "credential": "github-reader", "resource": "staging-repository-readme", "max_ttl": 300
+      }}
+    }
+  }
+}

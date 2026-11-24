@@ -1,0 +1,258 @@
+{
+  "measured_on": "2026-11-24",
+  "scope": "本机 macOS arm64，回环 HTTP、合成 DEV 服务、SQLite WAL/FULL。仅测试正常读取；不含真实 TLS、WAN、模型及浏览器渲染。",
+  "preliminary_run": "首次 3000 样本尝试在 8 并发的 KeyFence 预热出现一次 HTTP 502，未计入成功测量。模拟上游监听队列从 5 调整到 128 后，在相同最终版本上完整复测两轮。",
+  "measured_successful_reads": 36000,
+  "runs": [
+    {
+      "passed": true,
+      "binaries": {
+        "core_sha256": "848e3b8ccd6b8b4e39de7a259bd67949413cb073da36d140584654b558e86a89",
+        "keyfence_sha256": "81c792a091d45ce0d67905ce7b00c22e28b30125fa49742800bfc1e81d33cf16"
+      },
+      "host": {
+        "os": "Darwin",
+        "release": "27.2.0",
+        "arch": "arm64",
+        "python": "3.12.7"
+      },
+      "method": {
+        "target": "same synthetic DEV reader and local upstream GET /service/status",
+        "wire": "loopback HTTP; no TLS, WAN, browser rendering or external provider",
+        "latency": "client request start through receipt of full HTTP response; excludes response validation",
+        "quantiles": "nearest-rank over successful requests; differences between path quantiles, not paired latencies",
+        "schedule": "closed-loop load; rotated path order per chunk; one reusable HTTP client connection per path per worker",
+        "proxy_hop": "KeyFence HTTP fixture uses a fresh agent-side proxy connection per request",
+        "warmup_per_worker_and_path": 12,
+        "samples_per_path_per_concurrency": 3000
+      },
+      "measurements": [
+        {
+          "concurrency": 1,
+          "rounds": 12,
+          "paths": {
+            "direct": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.0564,
+              "p95_ms": 0.0788,
+              "p99_ms": 0.0883,
+              "successful_rps": 16232.1
+            },
+            "keyfence": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.4845,
+              "p95_ms": 0.595,
+              "p99_ms": 0.7173,
+              "successful_rps": 1996.1
+            },
+            "rust_keyfence_audit": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.511,
+              "p95_ms": 0.6705,
+              "p99_ms": 1.8047,
+              "successful_rps": 1711.1
+            }
+          },
+          "complete_minus_direct": {
+            "p50_ms": 0.4546,
+            "p95_ms": 0.5917,
+            "p99_ms": 1.7164
+          },
+          "complete_minus_keyfence": {
+            "p50_ms": 0.0265,
+            "p95_ms": 0.0755,
+            "p99_ms": 1.0874
+          }
+        },
+        {
+          "concurrency": 8,
+          "rounds": 12,
+          "paths": {
+            "direct": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.5003,
+              "p95_ms": 0.9535,
+              "p99_ms": 1.2978,
+              "successful_rps": 14163.9
+            },
+            "keyfence": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 1.604,
+              "p95_ms": 2.3035,
+              "p99_ms": 3.4261,
+              "successful_rps": 4582.7
+            },
+            "rust_keyfence_audit": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 1.6834,
+              "p95_ms": 2.3595,
+              "p99_ms": 3.3254,
+              "successful_rps": 4472.7
+            }
+          },
+          "complete_minus_direct": {
+            "p50_ms": 1.1831,
+            "p95_ms": 1.406,
+            "p99_ms": 2.0276
+          },
+          "complete_minus_keyfence": {
+            "p50_ms": 0.0794,
+            "p95_ms": 0.056,
+            "p99_ms": -0.1007
+          }
+        }
+      ],
+      "checks": {
+        "expected_upstream_reads": 18324,
+        "observed_upstream_reads": 18324,
+        "expected_full_stack_audit_rows": 6108,
+        "observed_full_stack_audit_rows": 6108,
+        "sqlite_journal": "wal",
+        "sqlite_quick_check": "ok"
+      }
+    },
+    {
+      "passed": true,
+      "binaries": {
+        "core_sha256": "848e3b8ccd6b8b4e39de7a259bd67949413cb073da36d140584654b558e86a89",
+        "keyfence_sha256": "81c792a091d45ce0d67905ce7b00c22e28b30125fa49742800bfc1e81d33cf16"
+      },
+      "host": {
+        "os": "Darwin",
+        "release": "27.2.0",
+        "arch": "arm64",
+        "python": "3.12.7"
+      },
+      "method": {
+        "target": "same synthetic DEV reader and local upstream GET /service/status",
+        "wire": "loopback HTTP; no TLS, WAN, browser rendering or external provider",
+        "latency": "client request start through receipt of full HTTP response; excludes response validation",
+        "quantiles": "nearest-rank over successful requests; differences between path quantiles, not paired latencies",
+        "schedule": "closed-loop load; rotated path order per chunk; one reusable HTTP client connection per path per worker",
+        "proxy_hop": "KeyFence HTTP fixture uses a fresh agent-side proxy connection per request",
+        "warmup_per_worker_and_path": 12,
+        "samples_per_path_per_concurrency": 3000
+      },
+      "measurements": [
+        {
+          "concurrency": 1,
+          "rounds": 12,
+          "paths": {
+            "direct": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.0575,
+              "p95_ms": 0.0789,
+              "p99_ms": 0.0953,
+              "successful_rps": 15885.1
+            },
+            "keyfence": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.4963,
+              "p95_ms": 0.6791,
+              "p99_ms": 0.9926,
+              "successful_rps": 1885.2
+            },
+            "rust_keyfence_audit": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.5475,
+              "p95_ms": 1.0103,
+              "p99_ms": 1.8139,
+              "successful_rps": 1569.4
+            }
+          },
+          "complete_minus_direct": {
+            "p50_ms": 0.49,
+            "p95_ms": 0.9314,
+            "p99_ms": 1.7186
+          },
+          "complete_minus_keyfence": {
+            "p50_ms": 0.0512,
+            "p95_ms": 0.3312,
+            "p99_ms": 0.8213
+          }
+        },
+        {
+          "concurrency": 8,
+          "rounds": 12,
+          "paths": {
+            "direct": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 0.4975,
+              "p95_ms": 0.9537,
+              "p99_ms": 1.2941,
+              "successful_rps": 14310.6
+            },
+            "keyfence": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 1.607,
+              "p95_ms": 2.2625,
+              "p99_ms": 3.376,
+              "successful_rps": 4537.4
+            },
+            "rust_keyfence_audit": {
+              "samples": 3000,
+              "success": 3000,
+              "errors": 0,
+              "failures": {},
+              "p50_ms": 1.6659,
+              "p95_ms": 2.2919,
+              "p99_ms": 2.6423,
+              "successful_rps": 4624.1
+            }
+          },
+          "complete_minus_direct": {
+            "p50_ms": 1.1684,
+            "p95_ms": 1.3382,
+            "p99_ms": 1.3482
+          },
+          "complete_minus_keyfence": {
+            "p50_ms": 0.0589,
+            "p95_ms": 0.0294,
+            "p99_ms": -0.7337
+          }
+        }
+      ],
+      "checks": {
+        "expected_upstream_reads": 18324,
+        "observed_upstream_reads": 18324,
+        "expected_full_stack_audit_rows": 6108,
+        "observed_full_stack_audit_rows": 6108,
+        "sqlite_journal": "wal",
+        "sqlite_quick_check": "ok"
+      }
+    }
+  ]
+}

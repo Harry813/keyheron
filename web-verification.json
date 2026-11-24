@@ -1,0 +1,42 @@
+{
+  "measured_on": "2026-11-24",
+  "platform": "Darwin arm64",
+  "core_sha256": "848e3b8ccd6b8b4e39de7a259bd67949413cb073da36d140584654b558e86a89",
+  "rustc": "1.99.1",
+  "profile": "release",
+  "api": {
+    "outcome": "passed",
+    "read_accounts": [
+      "dev-reader",
+      "stg-reader",
+      "prod-reader"
+    ],
+    "concurrent_retries": {
+      "accepted": 1,
+      "refused": 7,
+      "upstream_executions": 1
+    },
+    "audit_events_retained_across_restart": 49,
+    "role_separation": true,
+    "web_session_end_and_upstream_receipt_checked": true,
+    "terminal_and_web_share_one_history": true,
+    "expiry_and_environment_revocation_audited": true,
+    "environment_filter_and_pagination": true,
+    "role_tokens_rotated_on_restart": true
+  },
+  "browser": {
+    "desktop": "1440x1020",
+    "mobile": "390x844",
+    "role_links_removed_from_address": true,
+    "diagnostic_approved_used_revoked": true,
+    "second_request_denied": true,
+    "confirmed_retry_and_receipt": true,
+    "ended_session_released_base_access": true,
+    "keyboard_escape_dismissed": true,
+    "history_filter": true,
+    "role_restored_on_reload": true,
+    "no_mobile_page_overflow": true,
+    "page_errors": []
+  },
+  "scope": "本机 macOS/Chrome，独立演示身份、合成上游；未测试企业身份或生产环境。"
+}
