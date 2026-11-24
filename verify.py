@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import selectors
 import socket
 import subprocess
 import sys
@@ -28,6 +29,8 @@ def crash_fixture():
         token = control.switch("alice", "crash-test", "PROD")
         check(rt["PROD"].call(token, "GET", "/service/status")[0] == 200, "unusable initial token")
         print(json.dumps([rt[env].proxy_port for env in ("DEV", "STG", "PROD")]), flush=True)
+        # Crash only after the parent has verified the readiness notification.
+        check(sys.stdin.buffer.read(1) == b"!", "missing crash instruction")
         os._exit(0)
 
 
@@ -39,12 +42,22 @@ def can_connect(port):
 
 def crash_cleanup():
     with tempfile.TemporaryDirectory() as tmp:
-        # File-backed pipes also let the fixture's descendants finish independently.
-        with tempfile.TemporaryFile() as stdout:
-            subprocess.run([sys.executable, "-B", __file__, "--crash-fixture"], check=True,
-                           env={"PATH": os.defpath, "TMPDIR": tmp}, stdout=stdout, timeout=20)
-            stdout.seek(0)
-            ports = json.load(stdout)
+        with subprocess.Popen([sys.executable, "-B", __file__, "--crash-fixture"],
+                              env={"PATH": os.defpath, "TMPDIR": tmp},
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as controller:
+            try:
+                with selectors.DefaultSelector() as ready:
+                    ready.register(controller.stdout, selectors.EVENT_READ)
+                    check(ready.select(120), "cold fixture did not become ready within 120 seconds")
+                ports = json.loads(controller.stdout.readline())
+                check(len(set(ports)) == 3 and all(can_connect(p) for p in ports), "missing live fixture listeners")
+                controller.stdin.write(b"!")
+                controller.stdin.flush()
+                check(controller.wait(timeout=5) == 0, "fixture controller did not exit abruptly")
+            finally:
+                if controller.poll() is None:
+                    controller.kill()
+                    controller.wait()
         for _ in range(80):
             if not any(can_connect(port) for port in ports) and not list(Path(tmp).iterdir()):
                 return
