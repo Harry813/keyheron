@@ -60,6 +60,29 @@ def expect_error(status, fn, *args):
         raise AssertionError(f"expected HTTP {status}")
 
 
+def check_sdk_read_admission(info, producer, sessions):
+    url = producer.origin + READ
+    before = producer.arrivals
+    with producer.readers:
+        producer.pending = 0
+        producer.release.clear()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        reads = [pool.submit(curl, info, sessions[0], "PROD", url) for _ in range(4)]
+        try:
+            with producer.readers:
+                check(producer.readers.wait_for(lambda: producer.pending == 4, 5),
+                      "four SDK reads did not reach the upstream")
+            check(curl(info, sessions[1], "PROD", url)[0] == (200, 429),
+                  "the fifth SDK read should be rejected across sessions")
+            with producer.readers:
+                check(producer.pending == 4, "the fifth SDK read reached the upstream")
+        finally:
+            producer.release.set()
+        check(all(read.result()[0] == (200, 200) for read in reads), "admitted SDK reads failed")
+    check(curl(info, sessions[1], "PROD", url)[0] == (200, 200)
+          and producer.arrivals == before + 5, "SDK read capacity did not recover")
+
+
 def verify(core):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -125,11 +148,7 @@ def verify(core):
                     control(info, "sdk-session", {"environment": "PROD", "ttl": 60})
                     for _ in range(2)
                 ]
-                check(
-                    curl(info, sessions[0], "PROD", producer.origin + READ)[0]
-                    == (200, 200),
-                    "active SDK read failed",
-                )
+                check_sdk_read_admission(info, producer, sessions)
                 with sqlite3.connect(state / "events.sqlite3") as db:
                     # Keep an unrelated expiry pending while the reviewer revokes a live grant.
                     db.execute("""CREATE TRIGGER item_audit_failure BEFORE INSERT ON events
@@ -216,5 +235,5 @@ if __name__ == "__main__":
     parser.add_argument("--core", type=Path)
     verify(parser.parse_args().core)
     print(
-        "Managed read admission, approval availability and audited SDK recovery passed."
+        "Managed and SDK read admission, approval availability and audited SDK recovery passed."
     )
