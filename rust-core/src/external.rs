@@ -5,8 +5,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Buf, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -17,11 +16,20 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{timeout, Sleep},
+};
 use tokio_rustls::{
     rustls::{
         self,
@@ -32,7 +40,14 @@ use tokio_rustls::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_METADATA_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SDK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+// Each SDK read reserves its worst-case body size before fetching. The permit
+// is released only after the corresponding TLS response flushes or is aborted.
+const MAX_SDK_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SDK_READS: usize = 16;
+const SDK_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
+const SDK_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 const DENIAL_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Deserialize)]
@@ -109,6 +124,8 @@ pub struct External {
     task: String,
     targets: HashMap<String, Target>,
     sessions: Mutex<HashMap<String, Ticket>>,
+    sdk_reads: Semaphore,
+    sdk_response_bytes: Arc<Semaphore>,
     anonymous_denials: Arc<Mutex<Option<u64>>>,
 }
 
@@ -121,6 +138,335 @@ struct Reply {
 enum ResponseUse {
     Metadata,
     Sdk(Option<HeaderValue>),
+}
+
+impl ResponseUse {
+    fn max_bytes(&self) -> usize {
+        match self {
+            Self::Metadata => MAX_METADATA_RESPONSE_BYTES,
+            Self::Sdk(_) => MAX_SDK_RESPONSE_BYTES,
+        }
+    }
+}
+
+struct ActiveSdkResponse {
+    _permit: OwnedSemaphorePermit,
+    body_complete: bool,
+    flushed: bool,
+}
+
+#[derive(Default)]
+struct SdkConnectionState {
+    active: Mutex<Option<ActiveSdkResponse>>,
+}
+
+impl SdkConnectionState {
+    fn begin(&self, permit: OwnedSemaphorePermit) -> bool {
+        let Ok(mut active) = self.active.lock() else {
+            return false;
+        };
+        if active.is_some() {
+            return false;
+        }
+        *active = Some(ActiveSdkResponse {
+            _permit: permit,
+            body_complete: false,
+            flushed: false,
+        });
+        true
+    }
+
+    fn wrote(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(response) = active.as_mut() {
+                response.flushed = false;
+            }
+        }
+    }
+
+    fn body_complete(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            let release = active.as_mut().is_some_and(|response| {
+                response.body_complete = true;
+                response.flushed
+            });
+            if release {
+                active.take();
+            }
+        }
+    }
+
+    fn flushed(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            let release = active.as_mut().is_some_and(|response| {
+                response.flushed = true;
+                response.body_complete
+            });
+            if release {
+                active.take();
+            }
+        }
+    }
+
+    fn abort(&self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.take();
+        }
+    }
+}
+
+struct BudgetedBytes {
+    bytes: Bytes,
+    completes: Option<Arc<SdkConnectionState>>,
+}
+
+impl Buf for BudgetedBytes {
+    fn remaining(&self) -> usize {
+        self.bytes.remaining()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.bytes.chunk()
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        self.bytes.advance(cnt);
+    }
+}
+
+impl Drop for BudgetedBytes {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.completes {
+            connection.body_complete();
+        }
+    }
+}
+
+struct ProxyBody {
+    bytes: Bytes,
+    connection: Option<Arc<SdkConnectionState>>,
+    complete: bool,
+}
+
+impl ProxyBody {
+    fn immediate(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            connection: None,
+            complete: false,
+        }
+    }
+
+    fn sdk(bytes: Bytes, connection: Arc<SdkConnectionState>) -> Self {
+        let mut body = Self {
+            bytes,
+            connection: Some(connection),
+            complete: false,
+        };
+        if body.bytes.is_empty() {
+            body.connection.as_ref().unwrap().body_complete();
+            body.complete = true;
+        }
+        body
+    }
+}
+
+impl Drop for ProxyBody {
+    fn drop(&mut self) {
+        if !self.complete {
+            if let Some(connection) = &self.connection {
+                connection.abort();
+            }
+        }
+    }
+}
+
+impl Body for ProxyBody {
+    type Data = BudgetedBytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.bytes.is_empty() {
+            return Poll::Ready(None);
+        }
+        let chunk = self
+            .bytes
+            .split_to(self.bytes.len().min(SDK_RESPONSE_CHUNK_BYTES));
+        let completes = if self.bytes.is_empty() {
+            self.complete = true;
+            self.connection.as_ref().cloned()
+        } else {
+            None
+        };
+        Poll::Ready(Some(Ok(Frame::data(BudgetedBytes {
+            bytes: chunk,
+            completes,
+        }))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.bytes.len() as u64)
+    }
+}
+
+struct WriteTimeoutIo<T> {
+    inner: T,
+    response: Arc<SdkConnectionState>,
+    stalled: bool,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl<T> WriteTimeoutIo<T> {
+    fn new(inner: T, response: Arc<SdkConnectionState>) -> Self {
+        Self {
+            inner,
+            response,
+            stalled: false,
+            deadline: Box::pin(tokio::time::sleep(SDK_WRITE_STALL_TIMEOUT)),
+        }
+    }
+
+    fn stalled_error(&mut self, cx: &mut TaskContext<'_>) -> Option<io::Error> {
+        if !self.stalled {
+            self.deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + SDK_WRITE_STALL_TIMEOUT);
+            self.stalled = true;
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.response.abort();
+            Some(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SDK response write stalled",
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn write_progress(&mut self) {
+        self.stalled = false;
+        self.response.wrote();
+    }
+
+    fn write_failed(&mut self) {
+        self.stalled = false;
+        self.response.abort();
+    }
+
+    fn flush_complete(&mut self) {
+        self.stalled = false;
+        self.response.flushed();
+    }
+}
+
+impl<T> Drop for WriteTimeoutIo<T> {
+    fn drop(&mut self) {
+        self.response.abort();
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for WriteTimeoutIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for WriteTimeoutIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                this.write_progress();
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(error)) => {
+                this.write_failed();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => match this.stalled_error(cx) {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            },
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(Ok(written)) => {
+                this.write_progress();
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(error)) => {
+                this.write_failed();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => match this.stalled_error(cx) {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                this.flush_complete();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                this.write_failed();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => match this.stalled_error(cx) {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            },
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => {
+                this.flush_complete();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                this.write_failed();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => match this.stalled_error(cx) {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            },
+        }
+    }
 }
 
 impl Target {
@@ -307,6 +653,7 @@ impl Target {
         .context("凭据不能用于请求头")?;
         value.set_sensitive(true);
         let include_body = matches!(&response_use, ResponseUse::Sdk(_));
+        let max_bytes = response_use.max_bytes();
         let accept = match response_use {
             ResponseUse::Metadata => None,
             ResponseUse::Sdk(accept) => accept,
@@ -350,7 +697,7 @@ impl Target {
         }
         ensure!(
             resp.content_length()
-                .is_none_or(|len| len <= MAX_BYTES as u64),
+                .is_none_or(|len| len <= max_bytes as u64),
             "上游响应太大"
         );
         ensure!(
@@ -369,7 +716,7 @@ impl Target {
             .map_err(|_| anyhow!("没有收到完整上游响应"))?
         {
             received = received.saturating_add(chunk.len());
-            ensure!(received <= MAX_BYTES, "上游响应太大");
+            ensure!(received <= max_bytes, "上游响应太大");
             bytes.extend_from_slice(&chunk);
             if !include_body {
                 ensure!(!contains_secret(&bytes), "上游响应包含凭据，已拒绝返回");
@@ -408,6 +755,8 @@ impl External {
             task: config.task,
             targets,
             sessions: Mutex::new(HashMap::new()),
+            sdk_reads: Semaphore::new(MAX_SDK_READS),
+            sdk_response_bytes: Arc::new(Semaphore::new(MAX_SDK_IN_FLIGHT_BYTES)),
             anonymous_denials: Arc::default(),
         })
     }
@@ -537,7 +886,7 @@ impl External {
         mut req: Request<Incoming>,
         audit: Audit,
         slot: Arc<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<ProxyBody> {
         let token = req
             .headers()
             .get(header::PROXY_AUTHORIZATION)
@@ -613,14 +962,16 @@ impl External {
                     }
                 }
             };
+            let response_state = Arc::new(SdkConnectionState::default());
             let serve = http1::Builder::new().max_buf_size(16384).serve_connection(
-                TokioIo::new(tls),
+                TokioIo::new(WriteTimeoutIo::new(tls, response_state.clone())),
                 service_fn(move |r| {
                     let s = self.clone();
                     let t = ticket.clone();
                     let token = token.clone();
                     let a = audit.clone();
-                    async move { Ok::<_, Infallible>(s.forward(r, &t, &token, &a).await) }
+                    let state = response_state.clone();
+                    async move { Ok::<_, Infallible>(s.forward(r, &t, &token, &a, state).await) }
                 }),
             );
             tokio::pin!(serve);
@@ -643,7 +994,8 @@ impl External {
         issued: &Ticket,
         token: &str,
         audit: &Audit,
-    ) -> Response<Full<Bytes>> {
+        response_state: Arc<SdkConnectionState>,
+    ) -> Response<ProxyBody> {
         let target = &self.targets[&issued.env];
         let route = &target.config.routes["read"];
         if !self
@@ -688,6 +1040,34 @@ impl External {
             self.task,
             issued.sdk_id.as_deref().unwrap_or("-")
         );
+        let read_permit = match self.sdk_reads.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return refused(
+                    audit,
+                    Some(issued),
+                    Some(&route.resource),
+                    "SDK 读取达到并发上限，请稍后再试",
+                    429,
+                );
+            }
+        };
+        let response_budget = match self
+            .sdk_response_bytes
+            .clone()
+            .try_acquire_many_owned(MAX_SDK_RESPONSE_BYTES as u32)
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                return refused(
+                    audit,
+                    Some(issued),
+                    Some(&route.resource),
+                    "SDK 响应达到内存上限，请稍后再试",
+                    429,
+                );
+            }
+        };
         let reply = match target.fetch("read", None, ResponseUse::Sdk(accept)).await {
             Ok(r) => r,
             Err(_) => {
@@ -708,6 +1088,7 @@ impl External {
                 };
             }
         };
+        drop(read_permit);
         let status = reply.status;
         let label = if (200..300).contains(&status) {
             "allowed"
@@ -716,6 +1097,15 @@ impl External {
         } else {
             "failed"
         };
+        if !response_state.begin(response_budget) {
+            return refused(
+                audit,
+                Some(issued),
+                Some(&route.resource),
+                "SDK 连接仍在发送先前的响应",
+                429,
+            );
+        }
         if audit
             .record(
                 "agent",
@@ -727,16 +1117,17 @@ impl External {
             )
             .is_err()
         {
+            response_state.abort();
             return response(503, Bytes::new());
         }
-        let mut res = response(status, reply.body);
+        let mut res = sdk_response(status, reply.body, response_state);
         if let Some(mime) = reply.mime {
             res.headers_mut().insert(header::CONTENT_TYPE, mime);
         }
         res
     }
 
-    fn anonymous_refusal(&self, audit: &Audit, reason: &str, status: u16) -> Response<Full<Bytes>> {
+    fn anonymous_refusal(&self, audit: &Audit, reason: &str, status: u16) -> Response<ProxyBody> {
         let Ok(mut window) = self.anonymous_denials.lock() else {
             return response(503, Bytes::new());
         };
@@ -783,7 +1174,7 @@ impl Drop for DenialSummary {
 }
 
 #[cfg(test)]
-mod denial_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -800,6 +1191,8 @@ mod denial_tests {
             task: "test".into(),
             targets: HashMap::new(),
             sessions: Mutex::default(),
+            sdk_reads: Semaphore::new(MAX_SDK_READS),
+            sdk_response_bytes: Arc::new(Semaphore::new(MAX_SDK_IN_FLIGHT_BYTES)),
             anonymous_denials: Arc::default(),
         };
         assert_eq!(proxy.anonymous_refusal(&audit, "匿名", 407).status(), 407);
@@ -823,6 +1216,67 @@ mod denial_tests {
         std::fs::remove_file(path)?;
         Ok(())
     }
+
+    #[test]
+    fn sdk_limits_cap_retained_response_fanout() {
+        assert_eq!(
+            ResponseUse::Metadata.max_bytes(),
+            MAX_METADATA_RESPONSE_BYTES
+        );
+        assert_eq!(ResponseUse::Sdk(None).max_bytes(), MAX_SDK_RESPONSE_BYTES);
+        assert!(MAX_SDK_RESPONSE_BYTES < MAX_METADATA_RESPONSE_BYTES);
+        let budget = Arc::new(Semaphore::new(MAX_SDK_IN_FLIGHT_BYTES));
+        let reservations: Vec<_> = (0..MAX_SDK_IN_FLIGHT_BYTES / MAX_SDK_RESPONSE_BYTES)
+            .map(|_| {
+                budget
+                    .clone()
+                    .try_acquire_many_owned(MAX_SDK_RESPONSE_BYTES as u32)
+                    .expect("budget should admit the configured bounded fanout")
+            })
+            .collect();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(budget
+            .clone()
+            .try_acquire_many_owned(MAX_SDK_RESPONSE_BYTES as u32)
+            .is_err());
+        drop(reservations);
+        assert_eq!(budget.available_permits(), MAX_SDK_IN_FLIGHT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn sdk_budget_waits_for_transport_flush() {
+        use http_body_util::BodyExt;
+
+        let budget = Arc::new(Semaphore::new(MAX_SDK_IN_FLIGHT_BYTES));
+        let permit = budget
+            .clone()
+            .try_acquire_many_owned(MAX_SDK_RESPONSE_BYTES as u32)
+            .unwrap();
+        let connection = Arc::new(SdkConnectionState::default());
+        assert!(connection.begin(permit));
+        let mut body = ProxyBody::sdk(
+            Bytes::from_static(b"ordinary SDK response"),
+            connection.clone(),
+        );
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.data_ref().unwrap().chunk(), b"ordinary SDK response");
+        assert_eq!(
+            budget.available_permits(),
+            MAX_SDK_IN_FLIGHT_BYTES - MAX_SDK_RESPONSE_BYTES
+        );
+        drop(body);
+        assert_eq!(
+            budget.available_permits(),
+            MAX_SDK_IN_FLIGHT_BYTES - MAX_SDK_RESPONSE_BYTES
+        );
+        drop(frame);
+        assert_eq!(
+            budget.available_permits(),
+            MAX_SDK_IN_FLIGHT_BYTES - MAX_SDK_RESPONSE_BYTES
+        );
+        connection.flushed();
+        assert_eq!(budget.available_permits(), MAX_SDK_IN_FLIGHT_BYTES);
+    }
 }
 
 fn basic_token(value: &str) -> Option<String> {
@@ -833,20 +1287,33 @@ fn basic_token(value: &str) -> Option<String> {
     let text = String::from_utf8(STANDARD.decode(text).ok()?).ok()?;
     Some(text.strip_prefix("agent:")?.to_string())
 }
-fn response(status: u16, body: Bytes) -> Response<Full<Bytes>> {
-    let mut r = Response::new(Full::new(body));
+fn response(status: u16, body: Bytes) -> Response<ProxyBody> {
+    let mut r = Response::new(ProxyBody::immediate(body));
     *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
 }
+
+fn sdk_response(
+    status: u16,
+    body: Bytes,
+    connection: Arc<SdkConnectionState>,
+) -> Response<ProxyBody> {
+    let mut r = Response::new(ProxyBody::sdk(body, connection));
+    *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
 fn refused(
     audit: &Audit,
     ticket: Option<&Ticket>,
     resource: Option<&str>,
     reason: &str,
     status: u16,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let detail = match ticket.and_then(|s| s.sdk_id.as_deref()) {
         Some(id) => format!("SDK 会话 {id}，{reason}"),
         None => reason.to_string(),
