@@ -1,6 +1,7 @@
 """Trusted, task-scoped Warden connectors. Agent inputs select names, never destinations."""
 
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -22,6 +24,8 @@ from warden_control import ControlBusy, FIELDS, valid_id
 DB_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 MAX_SESSIONS = 16
 CHECK_INTERVAL = 1.0
+MAX_CACHED_READERS = 256
+VAULT_UNLOCKS_PER_SECOND = 2
 
 
 def _gitlab_paths(spec):
@@ -81,7 +85,45 @@ def _load_catalog(path, runtime):
     return catalog
 
 
-def _database_target(spec, runtime, request, grant):
+class _VaultReaders:
+    """A task caches only per-entry decryption capabilities. Each read still opens the vault."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = OrderedDict()
+        self.unlock_window = -1
+        self.unlocks = 0
+
+    def reader(self, policy, env, name):
+        from credential_store import vault_identity
+
+        settings = policy["credential_store"]
+        phrase_file = settings["passphrase_file"]
+        key = settings["path"], env, name
+        # Coalesce concurrent opens and cap the expensive work even if an unlock repeatedly fails.
+        with self.lock:
+            phrase = os.stat(phrase_file)
+            version = (phrase_file, phrase.st_dev, phrase.st_ino, phrase.st_uid, phrase.st_mode,
+                       phrase.st_size, phrase.st_mtime_ns, phrase.st_ctime_ns, vault_identity(settings["path"]))
+            previous = self.entries.get(key)
+            if previous and previous[0] == version:
+                self.entries.move_to_end(key)
+                return previous[1]
+            self.entries.pop(key, None)
+            window = int(time.monotonic())
+            if window != self.unlock_window:
+                self.unlock_window, self.unlocks = window, 0
+            if self.unlocks >= VAULT_UNLOCKS_PER_SECOND:
+                raise RuntimeError("凭据库解锁繁忙，请稍后重试")
+            self.unlocks += 1
+            reader = unlock_policy_store(policy).reader(env, name)
+            self.entries[key] = version, reader
+            if len(self.entries) > MAX_CACHED_READERS:
+                self.entries.popitem(last=False)
+            return reader
+
+
+def _database_target(spec, runtime, request, grant, readers):
     policy = load_config(spec["config"], database=True, read_json=trusted_json)
     target = policy["environments"][spec["env"]][spec["target"]]
     # Check the same target object passed to the broker, before touching its credentials.
@@ -92,7 +134,7 @@ def _database_target(spec, runtime, request, grant):
     if "password_ref" in target:
         if not policy.get("credential_store", {}).get("passphrase_file"):
             raise ValueError("无人值守的 Warden 需要凭据库解锁文件")
-        target["_read_secret"] = unlock_policy_store(policy).reader(spec["env"], target["password_ref"])
+        target["_read_secret"] = readers.reader(policy, spec["env"], target["password_ref"])
     read_password(target)
     if target.get("ca_file") and not Path(target["ca_file"]).is_file():
         raise ValueError("数据库 CA 文件不可用")
@@ -117,6 +159,7 @@ class PluginHost:
         self.session_grant = session_grant
         self.event = event
         self.sessions = {}
+        self.vault_readers = _VaultReaders()
         self.running = False
 
     async def __aenter__(self):
@@ -139,6 +182,7 @@ class PluginHost:
         await asyncio.gather(*(session.worker for session in sessions), return_exceptions=True)
         for executor in (self.session_checks, self.close_reports):
             await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+        self.vault_readers = _VaultReaders()
 
     def available(self, connector, action, resource):
         plugin = self.runtime.plugins.get(connector)
@@ -232,7 +276,8 @@ class PluginHost:
     async def _serve_database(self, operation, spec, session_id, stop, ready, deadline, request, grant):
         watch = asyncio.create_task(self._watch(operation, deadline, stop))
         try:
-            target, actor = await asyncio.to_thread(_database_target, spec, self.runtime, request, grant)
+            target, actor = await asyncio.to_thread(_database_target, spec, self.runtime, request, grant,
+                                                   self.vault_readers)
             ttl = min(target["max_ttl"], deadline - time.monotonic())
             if stop.is_set() or ttl <= 0:
                 return
