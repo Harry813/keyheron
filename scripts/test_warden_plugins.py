@@ -9,12 +9,15 @@ import sqlite3
 import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dbproxy.session import local_tls
 from warden_client import serve_one_database
+from warden_control import ControlBusy
 from warden_plugins import PluginHost
 
 
@@ -178,9 +181,17 @@ class WardenPlugins(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(list(self.root.rglob("connection.json")))
                     with patch("warden_plugins.MAX_SESSIONS", 1), self.assertRaises(RuntimeError):
                         await host.invoke("mysql", "connect", "orders")
+                    host.session_grant = self.grant
                     actual_port = info["port"]
                     info.update(port=1, host="untrusted.invalid")
                     reader, writer = await host.open_database_stream(info)
+                    def ordinary_busy(*_):
+                        raise ControlBusy("ordinary budget exhausted")
+
+                    host.authorize = ordinary_busy
+                    with self.assertRaises(ControlBusy):
+                        await host.open_database_stream(info)
+                    self.assertFalse(host.sessions[info["session_id"]].stop.is_set())
                     ping = b"\x01\x00\x00\x00\x0e"  # Classic COM_PING frame
                     writer.write(info["password"].encode() + b"\n" + ping)
                     await writer.drain()
@@ -209,6 +220,69 @@ class WardenPlugins(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "^连接器操作未完成$"):
                 await host.invoke("mysql", "connect", "orders")
             self.assertFalse(host.sessions)
+
+    async def test_full_watchdog_pool_keeps_allowed_sessions_and_observes_revocation(self):
+        seen = set()
+        lock = threading.Lock()
+        all_checked = threading.Event()
+        revoke_first = threading.Event()
+        stops = [asyncio.Event() for _ in range(16)]
+
+        def check(task, connector, action, resource):
+            time.sleep(0.35)  # Normal request; four batches take longer than one check timeout.
+            if resource == "orders-0" and revoke_first.is_set():
+                raise PermissionError
+            with lock:
+                seen.add(resource)
+                if len(seen) == len(stops):
+                    all_checked.set()
+            return self.grant(task, connector, action, resource)
+
+        async with self.host() as host:
+            host.session_grant = check
+            deadline = time.monotonic() + 15
+            watches = [asyncio.create_task(host._watch(("mysql", "connect", f"orders-{i}"), deadline, stop))
+                       for i, stop in enumerate(stops)]
+            try:
+                self.assertTrue(await asyncio.to_thread(all_checked.wait, 6))
+                self.assertFalse(any(stop.is_set() for stop in stops))
+                revoke_first.set()
+                await asyncio.wait_for(stops[0].wait(), 4)
+                self.assertFalse(any(stop.is_set() for stop in stops[1:]))
+            finally:
+                for watch in watches:
+                    watch.cancel()
+                await asyncio.gather(*watches, return_exceptions=True)
+
+    async def test_slow_checks_time_out_and_queued_session_keeps_its_absolute_deadline(self):
+        release = threading.Event()
+        calls = []
+        lock = threading.Lock()
+
+        def blocked(task, connector, action, resource):
+            with lock:
+                calls.append(resource)
+            release.wait(4)
+            return self.grant(task, connector, action, resource)
+
+        with patch("warden_plugins.CHECK_INTERVAL", 0.4):
+            async with self.host() as host:
+                host.session_grant = blocked
+                now = time.monotonic()
+                stops = [asyncio.Event() for _ in range(5)]
+                watches = [asyncio.create_task(host._watch(("mysql", "connect", f"orders-{i}"),
+                                                now + (0.6 if i == 4 else 5), stop))
+                           for i, stop in enumerate(stops)]
+                try:
+                    await asyncio.wait_for(stops[4].wait(), 2)
+                    self.assertFalse(any(stop.is_set() for stop in stops[:4]))
+                    await asyncio.wait_for(asyncio.gather(*watches), 1)
+                    self.assertCountEqual(calls, [f"orders-{i}" for i in range(4)])
+                finally:
+                    release.set()
+                    for watch in watches:
+                        watch.cancel()
+                    await asyncio.gather(*watches, return_exceptions=True)
 
     async def test_idle_client_removes_descriptor_when_warden_closes(self):
         local_sock, peer_sock = socket.socketpair()
