@@ -55,6 +55,8 @@ python3 scripts/run_warden_sandbox.py --socket /run/keyheron/review-001/warden.s
 
 容器通过 `KEYHERON_WARDEN_SOCKET` 找到任务入口，网络模式为 `none`，镜像根文件系统只读，可在容器的临时目录写入任务数据。启动器需要本机 Linux Docker Engine，以及能使用该 Engine、与 Warden 同 UID 的非 root 启动账户。拥有 Docker 管理权限的是宿主操作员。Agent 只收到任务 socket。单独在普通宿主 shell 启动 `warden` 和 `connector` 可用于功能测试，操作系统级隔离由沙箱启动器提供。
 
+每个沙箱最多使用 512 MiB 内存、1 个 CPU 核的计算时间和 128 个进程或线程。容器没有额外的交换空间，`/tmp` 的 64 MiB 临时存储计入内存用量。Docker Engine 需要启用对应的内存、交换空间和 CPU 配额控制器；启动器无法确认这些配额可用时会退出。
+
 数据库任务先绑定对应模板，在同一个 Agent 沙箱内运行下述客户端。客户端在临时目录写入私有连接描述文件，将文件路径输出到标准输出，并等待一个原生 SQL 客户端连接。让此进程在 SQL 客户端运行期间保持存活。描述文件包含沙箱内回环地址、临时口令和过期时间。SQL Server 还会得到本次连接可用的公开证书文件。请按[原生客户端设置](DATABASES.md#客户端设置)登录。这个转发只能连接 Warden 为当前请求签发的数据库会话。
 
 ```sh

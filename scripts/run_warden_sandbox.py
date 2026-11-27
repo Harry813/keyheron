@@ -47,6 +47,7 @@ def sandbox_args(socket_path, digest, command):
     return [
         "run", "--rm", "--interactive", "--pull=never",
         "--network=none", "--read-only", "--cap-drop=ALL",
+        "--memory=512m", "--memory-swap=512m", "--cpus=1",
         "--security-opt=no-new-privileges=true", "--pids-limit=128", "--ipc=private",
         "--log-driver=none", "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777",
         f"--mount=type=bind,src={socket_path},dst={CONTAINER_SOCKET},readonly",
@@ -73,6 +74,14 @@ def main():
         with tempfile.TemporaryDirectory(prefix="keyheron-docker-") as config:
             cli = ["docker", "--host=unix:///var/run/docker.sock", f"--config={config}"]
             env = {"PATH": "/usr/local/bin:" + os.defpath, "HOME": config}
+            # Some engines only warn when the kernel cannot enforce a requested limit.
+            capabilities = subprocess.run(
+                [*cli, "info", "--format",
+                 '{{and .CgroupDriver (ne .CgroupDriver "none") .MemoryLimit .SwapLimit .CPUCfsPeriod .CPUCfsQuota}}'],
+                env=env, stdout=subprocess.PIPE, text=True, check=True,
+            )
+            if capabilities.stdout.strip() != "true":
+                raise ValueError("Docker Engine 需要支持 cgroup 内存、交换空间和 CPU 配额")
             result = subprocess.run(
                 [*cli, "image", "inspect", "--format", "{{json .Config}}\n{{.Id}}", args.image],
                 env=env, stdout=subprocess.PIPE, text=True, check=True,
