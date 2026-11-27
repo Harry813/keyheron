@@ -917,6 +917,9 @@ async fn transition(
             if c.environment.as_deref() != Some(&base.environment) {
                 return Err(Failure::denied("目标环境与当前活动会话不符"));
             }
+            if !s.broker.supports_sdk(&base.environment) {
+                return Err(Failure::denied("此环境使用请求头凭据，仅支持受管读取。SDK 原始响应要求上游客户端证书认证"));
+            }
             let cap = s
                 .policy
                 .route(Some(&base.environment), "read")

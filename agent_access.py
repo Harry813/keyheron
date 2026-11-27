@@ -77,7 +77,7 @@ def load_config(path, *, database=False, read_json=None):
     selected = {}
     for name, raw in envs.items():
         mandatory = {"origin", "routes"}
-        https_fields = mandatory | {"ca_file", "credential_files", "credential_refs"}
+        https_fields = mandatory | {"ca_file", "credential_files", "credential_refs", "client_identities"}
         _checked_fields(raw, https_fields | {"databases"}, set())
         env = {k: v for k, v in raw.items() if k != "databases"}
         if not env and "databases" not in raw:
@@ -109,8 +109,13 @@ def load_config(path, *, database=False, read_json=None):
             raise ValueError(f"{name} 缺少只读路由")
         files = env.get("credential_files", {})
         refs = env.get("credential_refs", {})
-        if not isinstance(files, dict) or not isinstance(refs, dict) or not (files or refs):
+        identities = env.get("client_identities", {})
+        if not all(isinstance(x, dict) for x in (files, refs, identities)) or not (files or refs or identities):
             raise ValueError(f"{name} 缺少凭据引用")
+        if identities and (files or refs):
+            raise ValueError(f"{name} 不能混用客户端证书和请求头凭据")
+        # Older cores reject this field, including the empty map for header-only policies.
+        env["client_identities"] = {k: _file(logical_path.parent, v) for k, v in identities.items()}
         if files.keys() & refs.keys():
             raise ValueError(f"{name} 的同一凭据只能使用一个来源")
         if refs and "credential_store" not in data:
@@ -123,6 +128,8 @@ def load_config(path, *, database=False, read_json=None):
         selected[name] = env
     if not selected:
         raise ValueError("策略中没有数据库连接" if database else "策略中没有 HTTPS 服务；数据库连接请使用 db 命令")
+    if not database and len({bool(env.get("client_identities")) for env in selected.values()}) > 1:
+        raise ValueError("同一任务不能混用请求头凭据与客户端证书")
     data["environments"] = selected
     return data
 
@@ -296,6 +303,7 @@ def running_external(
                     e: {
                         "origin": v["origin"].rstrip("/"),
                         "read_path": v["routes"]["read"]["path"],
+                        "supports_sdk": bool(v.get("client_identities")),
                     }
                     for e, v in envs.items()
                 },
@@ -389,6 +397,8 @@ def _client_signals():
 def run_child(info, env, command):
     if not command or env not in info["environments"]:
         raise ValueError("需要已配置的环境以及 -- 后的客户端命令")
+    if info["environments"][env].get("supports_sdk") is not True:
+        raise ValueError("原文 SDK 读取需要使用上游客户端证书，并以支持该策略的版本启动服务")
     with _client_signals() as cancelled:
         if control(info, "state")["environment"] != env and not cancelled():
             control(info, "switch", {"environment": env})

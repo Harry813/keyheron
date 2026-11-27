@@ -17,7 +17,7 @@ from verify_external import Fixture, READ, check, curl, make_ca
 
 class PausedFixture(Fixture):
     def __init__(self, directory):
-        super().__init__(directory, "PROD")
+        super().__init__(directory, "PROD", mtls=True)
         self.readers = threading.Condition()
         self.pending = 0
         self.release = threading.Event()
@@ -36,10 +36,7 @@ class PausedFixture(Fixture):
                         self.send_error(503)
                         return
                 if fixture.large_read and self.path == READ:
-                    if (
-                        self.headers.get("Authorization")
-                        != "Bearer " + fixture.keys["reader"]
-                    ):
+                    if not self.authenticated_as("reader"):
                         self.send_error(401)
                         return
                     chunk = b"public fixture record\n" * 1024

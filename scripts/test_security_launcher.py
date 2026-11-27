@@ -23,7 +23,7 @@ from web_demo import role_links
 
 INFO = {
     "proxy_port": 1, "ca_file": "/fixture/ca.pem",
-    "environments": {"DEV": {"origin": "https://example.invalid", "read_path": "/fixture"}},
+    "environments": {"DEV": {"origin": "https://example.invalid", "read_path": "/fixture", "supports_sdk": True}},
 }
 
 
@@ -74,7 +74,9 @@ class SecurityLauncher(unittest.TestCase):
             policy["environments"]["DEV"]["credential_files"] = {"github-reader": "active"}
             config = root / "policy.json"
             config.write_text(json.dumps(policy))
-            path = Path(load_config(config)["environments"]["DEV"]["credential_files"]["github-reader"])
+            loaded = load_config(config)["environments"]["DEV"]
+            self.assertEqual(loaded["client_identities"], {})
+            path = Path(loaded["credential_files"]["github-reader"])
             self.assertEqual(path.read_text(), "first")
             (root / "pending").symlink_to("second")
             (root / "pending").replace(logical)
@@ -121,6 +123,30 @@ class SecurityLauncher(unittest.TestCase):
             status = run_child(INFO, "DEV", [sys.executable, "-c", "raise SystemExit(7)"])
         self.assertEqual(status, 7)
         self.assertEqual(output.getvalue().splitlines(), ["revoked"])
+
+    def test_sdk_rejection_preserves_active_environment(self):
+        for descriptor in ({}, {"supports_sdk": False}):
+            with self.subTest(descriptor=descriptor), patch("agent_access.control") as control:
+                with self.assertRaisesRegex(ValueError, "客户端证书"):
+                    run_child({"environments": {"STG": descriptor}}, "STG", ["unused"])
+                control.assert_not_called()
+
+    def test_sdk_and_header_credentials_require_separate_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = json.loads((ROOT / "examples/github-readonly.json").read_text())
+            dev = policy["environments"]["DEV"]
+            dev.pop("credential_refs")
+            (root / "identity.pem").touch(mode=0o600)
+            dev["client_identities"] = {"github-reader": "identity.pem"}
+            config = root / "policy.json"
+            config.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(ValueError, "同一任务"):
+                load_config(config)
+            dev["credential_refs"] = {"github-reader": "token"}
+            config.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(ValueError, "不能混用"):
+                load_config(config)
 
     def test_parent_cancellation(self):
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):

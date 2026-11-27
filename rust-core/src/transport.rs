@@ -324,6 +324,9 @@ impl Transport {
     pub fn is_external(&self) -> bool {
         matches!(self, Self::Configured(_))
     }
+    pub fn supports_sdk(&self, env: &str) -> bool {
+        matches!(self, Self::Configured(t) if t.supports_sdk(env))
+    }
     pub async fn issue(&self, env: &str, kind: &str, ttl: u64) -> Result<String> {
         match self {
             Self::Demo(t) => t.issue(env, kind, ttl).await,

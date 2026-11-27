@@ -6,22 +6,33 @@
 
 在获得源码并构建 Rust 程序后，运行 `python3 verify_external.py`。这条验收会验证上游实际收到的 DEV 与 PROD 凭据、不同 TLS 根、单独撤销、自然到期、切环境后旧授权失效，以及审批通过的一次性写操作。客户端会分别使用 curl 和 Python 标准库。常规验收不会连接 GitHub 私有仓库。
 
-## 接入你的私有 GitHub 测试仓
+## 使用 GitHub 令牌做受管读取
 
 1. 将 `examples/github-readonly.json` 复制到仓库之外的私有目录并重命名为 `policy.json`。把两个示例路径替换成你有权读取的实际仓库。只用一个环境时，可以删除另一个环境段。
 2. 给每个环境准备独立的只读凭据，限制到该环境的测试仓库和 Contents: read。在配置旁初始化 `vault/credentials.sqlite3`，用 `secrets put` 分别向 DEV 和 STG 录入名为 `github-reader` 的凭据。程序会在终端关闭回显。[凭据库操作说明](CREDENTIALS.md)
-3. 打开两个终端，在第一个启动服务，在第二个启动你的客户端。以下示例都从项目根目录运行；替换配置路径。
+3. 从项目根目录启动服务，在申请人工作台选择环境并执行读取。工作台显示上游状态和配置的账户名。Bearer、API Key 和自定义认证头配置只支持受管操作。`keyheron run` 会在切换环境前提示需要客户端证书，直接调用 SDK 签发接口会收到 403。
 
 ```sh
 python3 keyheron.py serve --config /path/to/private/policy.json --state-dir .keyheron --open
 ```
 
-```sh
-python3 keyheron.py run --state-dir .keyheron --env DEV -- python3 examples/read_resource.py
-python3 keyheron.py run --state-dir .keyheron --env STG -- python3 examples/read_resource.py
+## 用客户端证书向 SDK 返回业务正文
+
+给支持双向 TLS 的上游配置独立、最小权限的客户端身份。让上游验证客户端证书并授权对应路由，私钥只保存在可信代理上。在策略的 `environments` 中配置环境，例如：
+
+```json
+{
+  "DEV": {
+    "origin": "https://catalog.example.com",
+    "client_identities": {"reader": "keys/reader.pem"},
+    "routes": {"read": {"method": "GET", "path": "/records", "resource": "catalog", "credential": "reader"}}
+  }
+}
 ```
 
-这个客户端只使用标准 HTTPS 请求并打印状态和字节数。也可以把命令换成 `curl --fail --silent --show-error https://api.github.com/repos/YOUR-ORG/YOUR-DEV-REPO/readme`；curl 会向终端输出响应，请只在受信终端使用。网页和客户端共享当前任务；改变环境会收回其他正在使用旧环境的会话。到工作台“操作记录”按环境过滤，核对签发、SDK 请求和回收事件。
+每个身份的 PEM 包含客户端证书链和对应私钥，应仅允许可信宿主账户读取。轮换证书后重启代理。每个任务选择一种上游认证方式，使用请求头凭据和使用客户端证书的服务需分别启动。启用 SDK 正文读取的上游应使用独立身份，勿将原有可复用令牌另行提供给该服务。
+
+启动服务后，运行 `python3 keyheron.py run --state-dir .keyheron --env DEV -- python3 examples/read_resource.py`。客户端通过短期代理会话读取正文，上游通过 TLS 校验代理的客户端证书。切换环境会收回旧环境的会话。
 
 ## v1 策略
 
@@ -31,13 +42,14 @@ python3 keyheron.py run --state-dir .keyheron --env STG -- python3 examples/read
 |---|---|
 | `origin` | HTTPS 主机，可带端口，不带路径、查询或账户信息。 |
 | `credential_refs` | 从路由的凭据引用映射到同一环境的加密条目名。旧版 `credential_files` 可以继续引用由宿主管理的文件。同一引用只能配置一个来源。 |
+| `client_identities` | 从路由的 `credential` 名称映射到上游客户端身份 PEM。使用此模式的任务中所有环境均使用客户端证书，不配置请求头凭据。 |
 | `ca_file` | 可选的额外上游 CA，仅在该环境生效。默认验证正常的公共受信证书。 |
 | `routes.read` | 要求固定 GET 路径；是通用 SDK 唯一可使用的动作。 |
 | `routes.diagnose` | 可选的限时受管 GET；需独立审批。 |
 | `routes.retry` | 可选的单次受管 POST；需独立审批。只有上游实际支持 Idempotency-Key 才应设 `idempotency_supported: true`。 |
-| 各路由通用字段 | `method`、`path`、`resource`、`credential`，可选 `max_ttl`（1–900 秒）。默认注入 Authorization: Bearer；自定义 API Key 可用 `auth_header: "X-API-Key"`、`auth_scheme: ""`。 |
+| 各路由通用字段 | `method`、`path`、`resource`、`credential`，可选 `max_ttl`（1–900 秒）。使用请求头凭据时默认注入 Authorization: Bearer，自定义 API Key 可用 `auth_header: "X-API-Key"`、`auth_scheme: ""`。 |
 
-例如，下面两个条目可以放入某个环境的 `routes`。凭据引用必须在该环境的 `credential_refs` 或 `credential_files` 中声明。上游地址、动作和参数由可信维护者配置，客户端不能自行改写。
+下面两个示例使用请求头凭据，引用来自该环境的 `credential_refs` 或 `credential_files`。使用客户端证书时，路由的 `credential` 引用该环境的 `client_identities` 条目。上游地址、动作和参数由可信维护者配置，客户端不能自行改写。
 
 ```json
 {
