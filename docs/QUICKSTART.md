@@ -32,7 +32,7 @@ python3 keyheron.py serve --config /path/to/private/policy.json --state-dir .key
 
 每个身份的 PEM 包含客户端证书链和对应私钥，应仅允许可信宿主账户读取。轮换证书后重启代理。每个任务选择一种上游认证方式，使用请求头凭据和使用客户端证书的服务需分别启动。启用 SDK 正文读取的上游应使用独立身份，勿将原有可复用令牌另行提供给该服务。
 
-启动服务后，运行 `python3 keyheron.py run --state-dir .keyheron --env DEV -- python3 examples/read_resource.py`。客户端通过短期代理会话读取正文，上游通过 TLS 校验代理的客户端证书。切换环境会收回旧环境的会话。代理至多同时保留 4 个 SDK 读取响应，超额读取返回 429，可在已有读取结束后重试。
+启动服务后，运行 `python3 keyheron.py run --state-dir .keyheron --env DEV -- python3 examples/read_resource.py`。客户端通过短期代理会话读取正文，上游通过 TLS 校验代理的客户端证书。切换环境会收回旧环境的会话。代理至多同时保留 4 个 SDK 读取响应，超额读取返回 429，可在已有读取结束后重试。拒绝或失败事件按时间窗口汇总，成功读取逐条审计。
 
 ## v1 策略
 

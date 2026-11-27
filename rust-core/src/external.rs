@@ -139,7 +139,7 @@ pub struct External {
     targets: HashMap<String, Target>,
     sessions: Mutex<HashMap<String, Ticket>>,
     sdk_payload_slots: Arc<Semaphore>,
-    anonymous_denials: Arc<Mutex<Option<u64>>>,
+    rejection_windows: Arc<Mutex<HashMap<RejectionKey, AuditWindow>>>,
 }
 
 // Hyper may retain or slice a frame after the handler returns. Tie the permit
@@ -495,7 +495,7 @@ impl External {
             targets,
             sessions: Mutex::new(HashMap::new()),
             sdk_payload_slots: Arc::new(Semaphore::new(MAX_SDK_PAYLOADS)),
-            anonymous_denials: Arc::default(),
+            rejection_windows: Arc::default(),
         })
     }
 
@@ -642,15 +642,16 @@ impl External {
             .and_then(|token| self.ticket(&token).map(|s| (token, s)))
             .filter(|(_, s)| s.sdk_id.is_some() && s.kind == "read");
         if req.method() != Method::CONNECT {
-            return match session {
-                Some((_, ticket)) => {
-                    refused(&audit, Some(&ticket), None, "仅接受 HTTPS CONNECT", 403)
-                }
-                None => self.anonymous_refusal(&audit, "仅接受 HTTPS CONNECT", 403),
-            };
+            return self.refused(
+                &audit,
+                session.as_ref().map(|(_, ticket)| ticket),
+                None,
+                "仅接受 HTTPS CONNECT",
+                403,
+            );
         }
         let Some((token, ticket)) = session else {
-            let mut r = self.anonymous_refusal(&audit, "缺少有效 SDK 会话", 407);
+            let mut r = self.refused(&audit, None, None, "缺少有效 SDK 会话", 407);
             r.headers_mut().insert(
                 header::PROXY_AUTHENTICATE,
                 HeaderValue::from_static("Basic realm=\"KeyHeron\""),
@@ -666,7 +667,7 @@ impl External {
             || req.uri().path_and_query().is_some()
             || req.uri().scheme().is_some()
         {
-            return refused(
+            return self.refused(
                 &audit,
                 Some(&ticket),
                 Some(resource),
@@ -703,7 +704,7 @@ impl External {
                 result = timeout(Duration::from_secs(8), acceptor.accept(TokioIo::new(upgrade))) => match result {
                     Ok(Ok(tls)) => tls,
                     _ => {
-                        let _ = refused(&audit, Some(&ticket), None, "客户端 TLS 握手未完成", 403);
+                        let _ = self.refused(&audit, Some(&ticket), None, "客户端 TLS 握手未完成", 403);
                         return;
                     }
                 }
@@ -750,7 +751,7 @@ impl External {
             .ticket(token)
             .is_some_and(|s| s.sdk_id == issued.sdk_id && s.env == issued.env)
         {
-            return self.anonymous_refusal(audit, "授权已到期或收回", 403);
+            return self.refused(audit, None, None, "授权已到期或收回", 403);
         }
         let valid_host = req
             .headers()
@@ -774,7 +775,7 @@ impl External {
                 .get(header::CONTENT_LENGTH)
                 .is_some_and(|v| v != "0")
         {
-            return refused(
+            return self.refused(
                 audit,
                 Some(issued),
                 Some(&route.resource),
@@ -783,7 +784,7 @@ impl External {
             );
         }
         let Ok(slot) = self.sdk_payload_slots.clone().try_acquire_owned() else {
-            return refused(audit, Some(issued), Some(&route.resource), "SDK 读取忙", 429);
+            return self.refused(audit, Some(issued), Some(&route.resource), "SDK 读取忙", 429);
         };
         let accept = req.headers().get(header::ACCEPT).cloned();
         let details = format!(
@@ -794,38 +795,26 @@ impl External {
         let reply = match target.fetch("read", None, ResponseUse::Sdk(accept)).await {
             Ok(r) => r,
             Err(_) => {
-                return if audit
-                    .record(
-                        "agent",
-                        Some(&issued.env),
-                        "sdk_read",
-                        &route.resource,
-                        "failed",
-                        &details,
-                    )
-                    .is_ok()
-                {
-                    response(502, Bytes::new())
-                } else {
-                    response(503, Bytes::new())
-                };
+                return self.refused(audit, Some(issued), Some(&route.resource), "上游读取失败", 502);
             }
         };
         let status = reply.status;
-        let label = if (200..300).contains(&status) {
-            "allowed"
-        } else if status == 401 || status == 403 {
-            "denied"
-        } else {
-            "failed"
-        };
+        if !(200..300).contains(&status) {
+            return self.refused(
+                audit,
+                Some(issued),
+                Some(&route.resource),
+                &format!("上游 HTTP {status}"),
+                status,
+            );
+        }
         if audit
             .record(
                 "agent",
                 Some(&issued.env),
                 "sdk_read",
                 &route.resource,
-                label,
+                "allowed",
                 &format!("{details}，上游 HTTP {status}"),
             )
             .is_err()
@@ -839,47 +828,91 @@ impl External {
         res
     }
 
-    fn anonymous_refusal(&self, audit: &Audit, reason: &str, status: u16) -> Response<Full<Bytes>> {
-        let Ok(mut window) = self.anonymous_denials.lock() else {
+    fn refused(
+        &self,
+        audit: &Audit,
+        ticket: Option<&Ticket>,
+        resource: Option<&str>,
+        reason: &str,
+        status: u16,
+    ) -> Response<Full<Bytes>> {
+        let result = if matches!(status, 401 | 403 | 407 | 429) {
+            "denied"
+        } else {
+            "failed"
+        };
+        // At most two results per configured environment, plus anonymous denials.
+        // Session IDs, paths and arbitrary request fields never create new buckets.
+        let key = (ticket.map(|s| s.env.clone()), result);
+        let Ok(mut windows) = self.rejection_windows.lock() else {
             return response(503, Bytes::new());
         };
-        if let Some(suppressed) = &mut *window {
-            *suppressed = suppressed.saturating_add(1);
-            return response(status, Bytes::new());
+        if let Some(window) = windows.get_mut(&key) {
+            window.suppressed = window.suppressed.saturating_add(1);
+            return response(if window.recorded { status } else { 503 }, Bytes::new());
         }
-        *window = Some(0);
-        drop(window);
+        let detail = match ticket.and_then(|s| s.sdk_id.as_deref()) {
+            Some(id) => format!("SDK 会话 {id}，{reason}"),
+            None => reason.to_string(),
+        };
+        let recorded = audit
+            .record(
+                "agent",
+                key.0.as_deref(),
+                "sdk_read",
+                resource.unwrap_or("sdk-proxy"),
+                result,
+                &detail,
+            )
+            .is_ok();
+        windows.insert(
+            key.clone(),
+            AuditWindow { recorded, suppressed: u64::from(!recorded) },
+        );
+        drop(windows);
 
-        // One fixed-size bucket per proxy, including expired tickets on open tunnels.
         let summary = DenialSummary {
-            counts: self.anonymous_denials.clone(),
+            windows: self.rejection_windows.clone(),
+            key,
             audit: audit.clone(),
         };
         tokio::spawn(async move {
             tokio::time::sleep(DENIAL_WINDOW).await;
             drop(summary);
         });
-        refused(audit, None, None, reason, status)
+        response(if recorded { status } else { 503 }, Bytes::new())
     }
 }
 
+type RejectionKey = (Option<String>, &'static str);
+
+struct AuditWindow {
+    recorded: bool,
+    suppressed: u64,
+}
+
 struct DenialSummary {
-    counts: Arc<Mutex<Option<u64>>>,
+    windows: Arc<Mutex<HashMap<RejectionKey, AuditWindow>>>,
+    key: RejectionKey,
     audit: Audit,
 }
 
 // Flush the last partial window when orderly shutdown cancels the timer.
 impl Drop for DenialSummary {
     fn drop(&mut self) {
-        let suppressed = self.counts.lock().ok().and_then(|mut window| window.take());
-        if let Some(n @ 1..) = suppressed {
+        let window = self
+            .windows
+            .lock()
+            .ok()
+            .and_then(|mut windows| windows.remove(&self.key));
+        if let Some(AuditWindow { suppressed: n @ 1.., .. }) = window {
             let _ = self.audit.record(
                 "agent",
-                None,
+                self.key.0.as_deref(),
                 "sdk_read",
                 "sdk-proxy",
-                "denied",
-                &format!("另有 {n} 次未认证代理请求被拒绝"),
+                self.key.1,
+                &format!("另有 {n} 次 SDK 代理请求未完成"),
             );
         }
     }
@@ -907,8 +940,7 @@ mod denial_tests {
     }
 
     #[test]
-    fn anonymous_events_share_one_window_and_authenticated_events_remain_individual() -> Result<()>
-    {
+    fn sdk_rejections_are_bounded_per_environment_and_result() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -921,11 +953,11 @@ mod denial_tests {
             targets: HashMap::new(),
             sessions: Mutex::default(),
             sdk_payload_slots: Arc::new(Semaphore::new(MAX_SDK_PAYLOADS)),
-            anonymous_denials: Arc::default(),
+            rejection_windows: Arc::default(),
         };
-        assert_eq!(proxy.anonymous_refusal(&audit, "匿名", 407).status(), 407);
-        assert_eq!(proxy.anonymous_refusal(&audit, "已到期", 403).status(), 403);
-        assert_eq!(proxy.anonymous_refusal(&audit, "已收回", 403).status(), 403);
+        assert_eq!(proxy.refused(&audit, None, None, "匿名", 407).status(), 407);
+        assert_eq!(proxy.refused(&audit, None, None, "已到期", 403).status(), 403);
+        assert_eq!(proxy.refused(&audit, None, None, "已收回", 403).status(), 403);
         let ticket = Ticket {
             env: "DEV".into(),
             kind: "read".into(),
@@ -933,13 +965,35 @@ mod denial_tests {
             sdk_id: Some("known".into()),
             closed: tokio::sync::watch::channel(false).0,
         };
-        refused(&audit, Some(&ticket), None, "范围错误", 403);
-        assert_eq!(audit.list(None, None, 10)?.len(), 2);
+        let other_ticket = Ticket {
+            sdk_id: Some("other".into()),
+            ..ticket.clone()
+        };
+        proxy.refused(&audit, Some(&ticket), None, "范围错误", 403);
+        proxy.refused(&audit, Some(&other_ticket), None, "范围错误", 403);
+        proxy.refused(&audit, Some(&ticket), None, "读取忙", 429);
+        proxy.refused(&audit, Some(&other_ticket), None, "上游读取失败", 502);
+        proxy.refused(&audit, Some(&ticket), None, "上游读取失败", 502);
+        assert_eq!(audit.list(None, None, 10)?.len(), 3);
+        let individual = audit.list(Some("DEV"), None, 10)?;
+        assert!(individual
+            .iter()
+            .any(|event| event.result == "denied" && event.detail.contains("known")));
         drop(active);
         drop(runtime);
-        assert!(audit.list(None, None, 1)?[0].detail.contains("2 次"));
-        assert!(proxy.anonymous_denials.lock().unwrap().is_none());
-        assert_eq!(audit.list(None, None, 10)?.len(), 3);
+        let entries = audit.list(None, None, 10)?;
+        assert_eq!(entries.len(), 6);
+        assert!(entries
+            .iter()
+            .any(|event| event.environment.is_none() && event.detail.contains("2 次")));
+        let summaries = audit.list(Some("DEV"), None, 10)?;
+        assert!(summaries
+            .iter()
+            .any(|event| event.result == "denied" && event.detail.contains("2 次")));
+        assert!(summaries
+            .iter()
+            .any(|event| event.result == "failed" && event.detail.contains("1 次")));
+        assert!(proxy.rejection_windows.lock().unwrap().is_empty());
         drop(audit);
         std::fs::remove_file(path)?;
         Ok(())
@@ -960,27 +1014,4 @@ fn response(status: u16, body: Bytes) -> Response<Full<Bytes>> {
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
-}
-fn refused(
-    audit: &Audit,
-    ticket: Option<&Ticket>,
-    resource: Option<&str>,
-    reason: &str,
-    status: u16,
-) -> Response<Full<Bytes>> {
-    let detail = match ticket.and_then(|s| s.sdk_id.as_deref()) {
-        Some(id) => format!("SDK 会话 {id}，{reason}"),
-        None => reason.to_string(),
-    };
-    let recorded = audit
-        .record(
-            "agent",
-            ticket.map(|s| s.env.as_str()),
-            "sdk_read",
-            resource.unwrap_or("sdk-proxy"),
-            "denied",
-            &detail,
-        )
-        .is_ok();
-    response(if recorded { status } else { 503 }, Bytes::new())
 }
