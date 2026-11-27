@@ -21,7 +21,7 @@ ROOT_FILES = {
     "打开工作台.command", "performance.json", "verification.json", "web-verification.json",
     "requirements-db-postgres.txt", "requirements-credentials.txt", "credential_store.py", "secret_cli.py",
     "warden.py", "warden_client.py", "warden_control.py", "warden_plugins.py", "warden_admin.py",
-    "warden_storage.py", "plugin_runtime.py",
+    "warden_storage.py", "plugin_runtime.py", "warden_mcp.py", "requirements-mcp.txt",
 }
 NATIVE = ("keyheron-core-darwin-arm64", "keyheron-core-linux-amd64")
 PENDING = (

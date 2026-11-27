@@ -42,6 +42,34 @@ python3 warden_client.py invoke team-issues read release-blocker
 
 数据库扩展沿用相同接口。例如，清单可将 `finance-db/connect` 的 `driver` 设为 `postgresql`，资源配置则使用 `{"config":"databases.json","env":"DEV","target":"ledger-pg"}`。Rust 核心在 Warden 解锁数据库凭据前核对本次授权和实际目标引擎。原生登录、SQL 账户权限和撤权语义见 [Warden 使用说明](WARDEN.md)。
 
+## 在沙箱内使用 CLI 或 MCP
+
+CLI 适合脚本和原生数据库客户端。任务获准访问 PostgreSQL 时，运行 `python3 warden_client.py invoke postgresql connect orders` 会在沙箱内建立临时回环端口，输出私有连接描述文件的路径。用同一沙箱里的 `psql` 读取其中的连接信息，CLI 进程在连接期间保持运行。
+
+支持 MCP 的 Agent 可以让自己的 MCP 客户端启动 stdio 适配器。构建 Agent 镜像时安装 `requirements-mcp.txt`，将 `warden_client.py` 与 `warden_mcp.py` 放在同一目录。沙箱仍只需挂载它所属任务的 Warden socket。下面是采用 `mcpServers` 配置格式的客户端示例。
+
+```json
+{
+  "mcpServers": {
+    "keyheron": {
+      "command": "python3",
+      "args": ["/opt/keyheron/warden_mcp.py", "--socket", "/run/keyheron/warden.sock"]
+    }
+  }
+}
+```
+
+安装完整青鹭源码时，也可以使用 `python3 keyheron.py mcp`。适配器默认读取 `KEYHERON_WARDEN_SOCKET`。它使用官方 MCP Python SDK，通过标准输入输出通信。任务身份、授权判断和原生数据转发均走既有 Warden 路径。
+
+| MCP 工具 | 参数 | 结果 |
+| --- | --- | --- |
+| `list_connectors` | 无 | 当前任务可用的插件、动作、资源和 TTL |
+| `describe_connector` | `connector` | 插件接口及本任务可用的资源 |
+| `invoke_connector` | `connector`、`action`、`resource` | JSON 插件返回获准字段；数据库插件返回 `handle`、`descriptor_path`、`expires_at` |
+| `close_connection` | `handle` | 回收当前适配器实例创建的数据库连接 |
+
+例如，Agent 调用 `invoke_connector` 并传入 `{"connector":"postgresql","action":"connect","resource":"orders"}`，把返回的文件路径交给同一沙箱里的原生客户端。临时登录口令仅写入权限为 `0600` 的描述文件，MCP 工具响应仅交付上述三个字段。每次调用仍要在线鉴权，数据库保持原有到期和撤权行为；主动关闭、适配器正常退出时也会清理连接。MCP 不接收上游地址、任意 SQL、授权声明或宿主凭据。
+
 ## Agent 的 Unix socket 接口
 
 每个连接发送一行 UTF-8 JSON，以换行结尾，最大 4 KiB。每个连接处理一次请求。由 Warden 决定当前任务和对端 Server，Agent 只传插件、动作、资源别名。下列三行分别是三个独立连接的请求。

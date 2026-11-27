@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import secrets
 import tempfile
+
+
+MAX_CONNECTIONS = 16
 
 
 async def relay(left, right):
@@ -53,7 +57,12 @@ async def serve_one_database(remote, descriptor, ready):
             accepted.set_result((reader, writer))
 
     expires = datetime.fromisoformat(descriptor["expires_at"])
+    if expires.utcoffset() is None:
+        raise ValueError("数据库会话缺少有效的到期时间")
     ttl = (expires - datetime.now(timezone.utc)).total_seconds()
+    if ttl <= 0:
+        raise ConnectionError("数据库会话已到期")
+    deadline = asyncio.get_running_loop().time() + ttl
     with tempfile.TemporaryDirectory(prefix="keyheron-client-") as tmp:
         for field, file_field in (("ca_pem", "ca_file"), ("server_certificate_pem", "server_certificate")):
             if field in descriptor:
@@ -62,7 +71,9 @@ async def serve_one_database(remote, descriptor, ready):
                 descriptor[file_field] = str(path)
         server = await asyncio.start_server(accept, "127.0.0.1", 0)
         try:
-            async with asyncio.timeout(ttl):
+            async with asyncio.timeout_at(deadline):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ConnectionError("数据库会话已到期")
                 descriptor.update(host="127.0.0.1", port=server.sockets[0].getsockname()[1])
                 path = Path(tmp) / "connection.json"
                 with path.open("x") as out:
@@ -85,6 +96,142 @@ async def serve_one_database(remote, descriptor, ready):
             await server.wait_closed()
 
 
+async def _stop_workers(workers):
+    for worker in workers:
+        if not worker.done() and not worker.cancelling():
+            worker.cancel()
+    if workers:
+        # Cancelling a client request must not cancel the workers a second time during cleanup.
+        cleanup = asyncio.gather(*workers, return_exceptions=True)
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await asyncio.shield(cleanup)
+            raise
+
+
+class ConnectorSession:
+    """Sandbox-local client for one Warden socket; the context owns its live native bridges."""
+
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+        self._open = False
+        self._workers = set()
+        self._connections = {}
+
+    async def __aenter__(self):
+        if self._open or self._workers:
+            raise RuntimeError("连接器会话正在使用")
+        self._open = True
+        return self
+
+    async def __aexit__(self, *_):
+        self._open = False
+        await _stop_workers(tuple(self._workers))
+
+    async def list(self):
+        result, _ = await self._request({"op": "list"})
+        return result
+
+    async def describe(self, connector):
+        result, _ = await self._request({"api_version": 1, "op": "describe", "connector": connector})
+        return result
+
+    async def invoke(self, connector, action, resource):
+        result, _ = await self._invoke(connector, action, resource)
+        return result
+
+    async def _invoke(self, connector, action, resource):
+        return await self._request({"connector": connector, "action": action, "resource": resource})
+
+    async def close_connection(self, handle):
+        worker = self._connections.get(handle) if isinstance(handle, str) else None
+        if worker is None:
+            raise ValueError("未知或已关闭的数据库连接")
+        await _stop_workers((worker,))
+
+    def _finished(self, worker):
+        self._workers.discard(worker)
+        if not worker.cancelled():
+            worker.exception()  # A bridge can expire or be revoked after invoke() has returned.
+
+    async def _request(self, request):
+        if not self._open:
+            raise RuntimeError("请在连接器会话中执行操作")
+        ready = asyncio.get_running_loop().create_future()
+        worker = asyncio.create_task(self._exchange(request, ready))
+        self._workers.add(worker)
+        worker.add_done_callback(self._finished)
+        try:
+            await asyncio.wait((worker, ready), return_when=asyncio.FIRST_COMPLETED)
+            if worker.done():
+                result = worker.result()
+                if ready.done():
+                    raise ConnectionError("数据库会话已结束")
+                return result, None
+            return ready.result(), worker
+        except BaseException:
+            await _stop_workers((worker,))
+            raise
+        finally:
+            if not ready.done():
+                ready.cancel()
+
+    async def _exchange(self, request, ready):
+        writer = handle = None
+        try:
+            async with asyncio.timeout(35):
+                body = json.dumps(request).encode("utf-8") + b"\n"
+                if len(body) > 4096:
+                    raise ValueError("连接器请求超出大小限制")
+                reader, writer = await asyncio.open_unix_connection(self.socket_path, limit=2 * 1024 * 1024)
+                writer.write(body)
+                await writer.drain()
+                try:
+                    reply = json.loads(await reader.readuntil(b"\n"))
+                except (asyncio.LimitOverrunError, asyncio.IncompleteReadError, ValueError, RecursionError):
+                    raise ConnectionError("Warden 响应无效或连接已关闭") from None
+            if isinstance(reply, dict) and set(reply) == {"error"} and isinstance(reply["error"], str):
+                raise RuntimeError(reply["error"])
+            if not isinstance(reply, dict) or "result" not in reply or reply.keys() - {"result", "transport"}:
+                raise ConnectionError("Warden 未返回有效结果")
+            transport = reply.get("transport")
+            # The first Warden release omitted transport for its database/connect connector.
+            if transport is None and (request.get("connector"), request.get("action")) == ("database", "connect"):
+                transport = "database-stream"
+            if transport is None:
+                return reply["result"]
+            if transport != "database-stream" or "action" not in request:
+                raise RuntimeError("Warden 返回了不支持的连接器传输方式")
+            descriptor = reply["result"]
+            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("expires_at"), str):
+                raise ConnectionError("Warden 未返回有效数据库会话")
+            if len(self._connections) >= MAX_CONNECTIONS:
+                raise RuntimeError("当前连接器会话的数据库连接数已达上限")
+            handle = secrets.token_urlsafe(24)
+            self._connections[handle] = asyncio.current_task()
+
+            def publish(path):
+                ready.set_result({"handle": handle, "descriptor_path": str(path), "expires_at": descriptor["expires_at"]})
+
+            await serve_one_database((reader, writer), descriptor, publish)
+        finally:
+            try:
+                if writer is not None:
+                    if asyncio.current_task().cancelling():
+                        writer.transport.abort()
+                    else:
+                        writer.close()
+                    try:
+                        async with asyncio.timeout(2):
+                            await writer.wait_closed()
+                    except (ConnectionError, TimeoutError):
+                        writer.transport.abort()
+            finally:
+                if handle is not None:
+                    self._connections.pop(handle, None)
+
+
 def add_arguments(parser):
     parser.add_argument("--socket", type=Path,
                         default=os.environ.get("KEYHERON_WARDEN_SOCKET", "/run/keyheron/warden.sock"))
@@ -99,34 +246,18 @@ def add_arguments(parser):
 
 
 async def run(args):
-    if args.operation == "list":
-        request = {"op": "list"}
-    elif args.operation == "describe":
-        request = {"api_version": 1, "op": "describe", "connector": args.connector}
-    else:
-        request = {"connector": args.connector, "action": args.plugin_action, "resource": args.resource}
-    reader, writer = await asyncio.open_unix_connection(args.socket, limit=2 * 1024 * 1024)
-    try:
-        writer.write(json.dumps(request).encode() + b"\n")
-        await writer.drain()
-        async with asyncio.timeout(35):
-            reply = json.loads(await reader.readline())
-        if "error" in reply:
-            raise RuntimeError(reply["error"])
-        transport = reply.get("transport")
-        # Older Wardens only supported database/connect and omitted the transport field.
-        if transport is None and (request.get("connector"), request.get("action")) == ("database", "connect"):
-            transport = "database-stream"
-        if transport == "database-stream":
-            await serve_one_database((reader, writer), reply["result"], lambda path: print(path, flush=True))
-        elif transport is None:
-            print(json.dumps(reply["result"], ensure_ascii=False, indent=2))
+    async with ConnectorSession(args.socket) as session:
+        if args.operation == "list":
+            result = await session.list()
+        elif args.operation == "describe":
+            result = await session.describe(args.connector)
         else:
-            raise RuntimeError("连接器使用了当前客户端不支持的传输方式")
-    finally:
-        writer.close()
-        with suppress(ConnectionError):
-            await writer.wait_closed()
+            result, worker = await session._invoke(args.connector, args.plugin_action, args.resource)
+            if worker is not None:
+                print(result["descriptor_path"], flush=True)
+                await worker
+                return
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

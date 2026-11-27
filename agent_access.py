@@ -439,6 +439,9 @@ def main():
     for flag in ("ca", "cert", "key", "plugins", "state-dir"):
         worker.add_argument("--" + flag, required=True, type=Path)
     warden_client.add_arguments(sub.add_parser("connector", help="通过本任务的 Warden 使用已授权连接器"))
+    mcp = sub.add_parser("mcp", help="为沙箱内的 Agent 启动 Warden MCP stdio 适配器")
+    mcp.add_argument("--socket", type=Path,
+                     default=os.environ.get("KEYHERON_WARDEN_SOCKET", "/run/keyheron/warden.sock"))
     serve = sub.add_parser("serve", help="启动已配置的 HTTPS 工作台和凭据代理")
     serve.add_argument("--config", type=Path, required=True)
     serve.add_argument("--core", type=Path)
@@ -456,6 +459,11 @@ def main():
     for p in (serve, run):
         p.add_argument("--state-dir", type=Path, default=Path(".keyheron"))
     args = parser.parse_args()
+    if args.action == "mcp":
+        if sys.version_info < (3, 11):
+            raise RuntimeError("Warden MCP 适配器需要 Python 3.11 或更新版本")
+        from warden_mcp import serve as serve_mcp
+        return serve_mcp(args.socket)
     if args.action == "warden-server":
         return warden_control.serve(args)
     if args.action == "warden-admin":

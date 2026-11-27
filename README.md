@@ -21,6 +21,8 @@ python3 verify_external.py
 
 ## 接入方式
 
+**沙箱内的 Agent 可使用 CLI 或 MCP。** 两个入口共用任务 socket 和在线授权。MCP 提供连接器发现、说明、调用和连接关闭；数据库工具返回临时连接文件的路径，可供同一沙箱内的原生客户端使用。[CLI 与 MCP 配置](docs/PLUGIN-API.md#在沙箱内使用-cli-或-mcp)
+
 **按任务授权连接器。** 管理员可在 Warden 工作台创建基础模板，分别授予 GitLab 合并请求读取、PostgreSQL、MySQL 或 SQL Server 指定目标的连接权限。Agent 通过任务专属 Unix socket 使用插件，Warden 通过 TLS 1.3 双向认证向 Server 在线核验每次调用。原生 Linux 启动器可将这个 socket 单独挂入无外网的 Agent 容器。[Warden 部署、授权与验证](docs/WARDEN.md) · [Rust 插件开发接口 v1](docs/PLUGIN-API.md)
 
 新配置把上游数据库密码和 HTTPS 令牌保存在 AES-256-GCM 加密凭据库中。代理在受信宿主上解锁，Agent 只获得本次任务的访问凭据。[凭据库使用说明](docs/CREDENTIALS.md)

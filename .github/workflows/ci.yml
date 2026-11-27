@@ -61,7 +61,7 @@ jobs:
           python3 scripts/test_security_launcher.py
           python3 scripts/test_security_state.py
           python3 scripts/test_security_limits.py
-          python3 -m pip install -r requirements-db-postgres.txt -r requirements-credentials.txt
+          python3 -m pip install -r requirements-db-postgres.txt -r requirements-credentials.txt -r requirements-mcp.txt
           python3 scripts/test_credential_store.py
           python3 scripts/test_secret_cli.py
           python3 scripts/verify_https_vault.py
