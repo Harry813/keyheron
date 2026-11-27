@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sqlite3
 import ssl
+from socketserver import TCPServer
 import threading
 from urllib.parse import urlsplit
 
@@ -261,7 +262,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, {"allowed": True, "ttl": ttl})
 
 
-class ControlServer(ThreadingHTTPServer):
+class WardenHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally reverse-resolves the bound IP. Warden endpoints use the
+        # listener address for display and TLS SANs for identity; neither needs a PTR lookup.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class ControlServer(WardenHTTPServer):
     """Run each timed TLS handshake in its worker, outside the accept loop."""
 
     def __init__(self, address, policy, audit, ca, cert, key):

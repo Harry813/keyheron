@@ -3,7 +3,7 @@ from contextlib import closing
 import fcntl
 import hashlib
 import hmac
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
@@ -14,7 +14,7 @@ import tempfile
 import webbrowser
 
 from plugin_runtime import PluginRuntime, add_runtime_arguments
-from warden_control import _object, valid_id, validate_policy
+from warden_control import WardenHTTPServer, _object, valid_id, validate_policy
 from warden_storage import MAX_POLICY, open_audit, open_policy_lock, read_policy_bytes, trusted_path
 
 
@@ -206,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503, {"error": "策略文件不可写，请核对目录和文件权限"})
 
 
-class AdminServer(ThreadingHTTPServer):
+class AdminServer(WardenHTTPServer):
     def __init__(self, port, policy, audit, *, runtime=None):
         self.actions = (runtime or PluginRuntime()).actions
         self.policy = Path(policy).absolute()

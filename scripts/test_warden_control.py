@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from verify_external import make_ca
@@ -72,6 +73,13 @@ class ControlTest(unittest.TestCase):
 
     def set_grants(self, grants):
         self.policy.write_text(json.dumps({"version": 1, "wardens": {IDENTITY: {"tasks": {"review": grants}}}}))
+
+    def test_listener_starts_without_reverse_dns(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("unexpected reverse DNS")):
+            with ControlServer(("127.0.0.1", 0), self.policy, self.audit, self.trust,
+                               self.ca / "server.pem", self.ca / "server.key") as server:
+                self.assertEqual(server.server_name, "127.0.0.1")
+                self.assertEqual(server.server_port, server.socket.getsockname()[1])
 
     def test_scope_revocation_and_audit(self):
         self.assertEqual(self.client.authorize(*SCOPE), 30)
