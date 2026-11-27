@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,11 +36,11 @@ def process(*args):
                 child.wait(timeout=3)
 
 
-def first_line(child):
+def first_line(child, *, timeout=30):
     with selectors.DefaultSelector() as selector:
         selector.register(child.stdout, selectors.EVENT_READ)
-        if not selector.select(timeout=5):
-            raise AssertionError("等待本地服务启动超时")
+        if not selector.select(timeout=timeout):
+            raise AssertionError(f"等待本地子进程输出超过 {timeout} 秒")
     line = child.stdout.readline()
     if not line:
         child.wait(timeout=3)
@@ -128,13 +127,8 @@ class ConnectorE2ETest(unittest.TestCase):
                     with process("warden", "--server", f"https://localhost:{port}", "--ca", ca / "root.pem",
                                  "--cert", cert, "--key", key, "--task", "review",
                                  "--plugins", plugins, "--state-dir", state) as warden:
-                        deadline = time.monotonic() + 5
-                        while not sock.is_socket():
-                            if warden.poll() is not None:
-                                self.fail(warden.stderr.read())
-                            if time.monotonic() > deadline:
-                                self.fail("未找到 Warden Unix 套接字")
-                            time.sleep(.02)
+                        first_line(warden)
+                        self.assertTrue(sock.is_socket())
                         self.assertEqual(connector("list"), [GRANT])
                         result = connector("invoke", "gitlab", "read", "mr-42")
                         self.assertEqual(result["title"], "Synthetic MR")

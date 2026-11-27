@@ -77,7 +77,7 @@ def verify_managed_postgres(config, psql):
                         try:
                             active.stdin.write("select current_user, current_database(), 6 * 7;\n")
                             active.stdin.flush()
-                            assert first_line(active).strip() == "fixture_owner|postgres|42"
+                            assert first_line(active, timeout=5).strip() == "fixture_owner|postgres|42"
                             revoked = change(policy, "revoke", {
                                 "revision": snapshot(policy)["revision"], "warden": IDENTITY, "task": task,
                             })
