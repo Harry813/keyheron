@@ -22,6 +22,7 @@ from warden_control import ControlBusy, FIELDS, valid_id
 DB_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 MAX_SESSIONS = 16
 CHECK_INTERVAL = 1.0
+SESSION_CHECK_WORKERS = 4
 
 
 def _gitlab_paths(spec):
@@ -126,7 +127,8 @@ class PluginHost:
             raise ValueError("Warden 状态目录须由当前账户独占")
         # Ordinary Agent work can occupy the default executor. Only active database
         # sessions submit to these two pools, bounding queued jobs by MAX_SESSIONS.
-        self.session_checks = ThreadPoolExecutor(max_workers=4, thread_name_prefix="warden-check")
+        self.session_checks = ThreadPoolExecutor(max_workers=SESSION_CHECK_WORKERS, thread_name_prefix="warden-check")
+        self.check_slots = asyncio.Semaphore(SESSION_CHECK_WORKERS)
         self.close_reports = ThreadPoolExecutor(max_workers=2, thread_name_prefix="warden-close")
         self.running = True
         return self
@@ -145,12 +147,27 @@ class PluginHost:
         return bool(plugin and plugin["action"] == action and resource in self.catalog.get(connector, {}))
 
     async def _grant(self, operation, *, session_check=False):
-        started = time.monotonic()
         authorize = self.session_grant if session_check and self.session_grant is not None else self.authorize
         if session_check:
             loop = asyncio.get_running_loop()
-            grant = await loop.run_in_executor(self.session_checks, authorize, self.task, *operation)
+            slots = self.check_slots
+            await slots.acquire()
+            started = time.monotonic()
+            try:
+                pending = loop.run_in_executor(self.session_checks, authorize, self.task, *operation)
+            except RuntimeError:
+                slots.release()
+                raise
+            # Cancellation cannot interrupt synchronous TLS. Keep the slot until the worker exits.
+            def finished(check):
+                slots.release()
+                if not check.cancelled():
+                    check.exception()  # A timed-out watcher may already have stopped awaiting this call.
+            pending.add_done_callback(finished)
+            async with asyncio.timeout(CHECK_INTERVAL):
+                grant = await asyncio.shield(pending)
         else:
+            started = time.monotonic()
             grant = await asyncio.to_thread(authorize, self.task, *operation)
         expected = dict(zip(FIELDS, (self.task, *operation)))
         ttl = grant.get("ttl")
@@ -191,13 +208,15 @@ class PluginHost:
             raise RuntimeError("连接器操作未完成") from None
 
     async def _watch(self, operation, deadline, stop):
+        # A full task may need four successive batches. A slow upstream request still gets one interval.
+        batches = (MAX_SESSIONS + SESSION_CHECK_WORKERS - 1) // SESSION_CHECK_WORKERS
         try:
             while not stop.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 await asyncio.sleep(min(CHECK_INTERVAL, remaining))
-                async with asyncio.timeout(min(CHECK_INTERVAL, deadline - time.monotonic())):
+                async with asyncio.timeout(min(batches * CHECK_INTERVAL, deadline - time.monotonic())):
                     renewed_deadline, _ = await self._grant(operation, session_check=True)
                     deadline = min(deadline, renewed_deadline)
         except Exception:
