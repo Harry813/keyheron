@@ -1,6 +1,7 @@
 """Real mTLS, live connector revocation and fail-closed audit regressions."""
 
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 from pathlib import Path
@@ -16,7 +17,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from verify_external import make_ca
-from warden_control import ControlClient, ControlServer, read_policy
+from warden_control import (ControlBusy, ControlClient, ControlServer, _Quota, _QUOTAS, _RequestBudget,
+                            _read_policy_state, read_policy)
 
 
 IDENTITY = "spiffe://keyheron/warden/demo"
@@ -185,6 +187,112 @@ class ControlTest(unittest.TestCase):
             db.execute("CREATE TRIGGER fail BEFORE INSERT ON warden_events BEGIN SELECT RAISE(FAIL, 'stop'); END")
         with self.assertRaisesRegex(OSError, "HTTP 503"):
             self.client.authorize(*SCOPE)
+
+    def test_task_budgets_precede_tls_policy_and_audit_and_leave_other_tasks_available(self):
+        self.policy.write_text(json.dumps({"version": 1, "wardens": {
+            IDENTITY: {"tasks": {"review": [GRANT], "second": [GRANT]}}}}))
+        with (patch.dict(_QUOTAS, ordinary=_QUOTAS["ordinary"]._replace(task_rate=2)),
+              patch("warden_control.time") as clock,
+              patch("warden_control._read_policy_state", wraps=_read_policy_state) as read):
+            clock.monotonic.return_value = 10
+            self.client.capabilities("review")
+            with self.assertRaises(PermissionError):
+                self.client.authorize(*SCOPE[:-1], "ungranted")
+            with patch.object(self.client, "_send") as send, self.assertRaises(ControlBusy):
+                self.client.capabilities("review")
+            send.assert_not_called()
+            second = ControlClient(self.url, self.trust, *self.warden)
+            with self.assertRaisesRegex(ControlBusy, "HTTP 429"):
+                second.capabilities("review")
+            self.assertEqual(second.capabilities("second"), [GRANT])
+            self.assertEqual(read.call_count, 3)
+            with closing(sqlite3.connect(self.audit)) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM warden_events").fetchone(), (3,))
+            clock.monotonic.return_value = 11
+            self.assertEqual(self.client.authorize(*SCOPE), 30)
+
+    def test_task_concurrency_is_released_after_errors(self):
+        budget = _RequestBudget()
+        with patch.dict(_QUOTAS, ordinary=_QUOTAS["ordinary"]._replace(task_concurrent=1)):
+            with self.assertRaises(ValueError), budget.request("first"):
+                with self.assertRaises(ControlBusy), budget.request("first"):
+                    self.fail("exceeded task concurrency")
+                with budget.request("second"):
+                    raise ValueError
+            with budget.request("first"):
+                self.assertEqual(budget.active, {("ordinary", "first"): 1})
+
+    def test_lifecycle_budgets_survive_task_and_server_limits_and_honor_revocation(self):
+        other = ControlClient(self.url, self.trust, *self.warden)
+        with (patch.dict(_QUOTAS, ordinary=_Quota(2, 2, 1, 1), session=_Quota(2, 2, 1, 1),
+                         outcome=_Quota(1, 1, 1, 1), closed=_Quota(1, 1, 1, 1)),
+              patch("warden_control.time") as clock):
+            clock.monotonic.return_value = 10
+            with self.assertRaises(PermissionError):
+                self.client.plugin_grant(*SCOPE, session_check=True)  # No previous authorization.
+            self.client.authorize(*SCOPE)
+            self.client.capabilities("review")
+            with self.assertRaises(ControlBusy):
+                self.client.capabilities("review")
+            with self.assertRaisesRegex(OSError, "HTTP 429"):
+                other.capabilities("different")
+            self.assertEqual(self.client.plugin_grant(*SCOPE, session_check=True)["ttl"], 30)
+            with self.assertRaises(ControlBusy):
+                self.client.plugin_grant(*SCOPE, session_check=True)
+            self.client.event(*SCOPE, "succeeded")
+            with self.assertRaises(ControlBusy):
+                self.client.event(*SCOPE, "failed")
+            self.set_grants([])
+            self.client.event(*SCOPE, "closed")  # Independent of every other budget.
+            clock.monotonic.return_value = 11
+            with self.assertRaises(PermissionError):
+                self.client.plugin_grant(*SCOPE, session_check=True)
+            with closing(sqlite3.connect(self.audit)) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM warden_events WHERE result='closed'").fetchone(),
+                                 (1,))
+
+    def test_parallel_session_closures_use_bounded_client_connections_and_reach_audit(self):
+        self.client.authorize(*SCOPE)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            reports = [pool.submit(self.client.event, *SCOPE, "closed") for _ in range(16)]
+            for report in reports:
+                report.result()
+        with closing(sqlite3.connect(self.audit)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM warden_events WHERE result='closed'").fetchone(),
+                             (16,))
+
+    def test_close_retries_only_a_confirmed_admission_refusal(self):
+        with (patch.object(self.client, "_post", side_effect=[ControlBusy(), {"recorded": True}]) as send,
+              patch("warden_control.time.sleep") as sleep):
+            self.client.event(*SCOPE, "closed")
+            self.assertEqual(send.call_count, 2)
+            sleep.assert_called_once_with(1)
+        with patch.object(self.client, "_post", side_effect=OSError) as send, self.assertRaises(OSError):
+            self.client.event(*SCOPE, "closed")
+        send.assert_called_once()
+
+    def test_audit_rotation_preserves_legacy_rows_and_unexpired_authorizations(self):
+        self.client.capabilities("review")
+        with closing(sqlite3.connect(self.audit)) as db, db:
+            db.execute("DROP TABLE warden_audit_retention")  # Reopen a database from before retention.
+        with ControlServer(("127.0.0.1", 0), self.policy, self.audit, self.trust,
+                           self.ca / "server.pem", self.ca / "server.key"):
+            pass
+        with patch("warden_control.AUDIT_PRUNE_INTERVAL", 1), patch("warden_control.AUDIT_HISTORY_ROWS", 2):
+            self.client.authorize(*SCOPE)
+            for _ in range(4):
+                self.client.capabilities("review")
+            self.set_grants([])
+            self.client.event(*SCOPE, "closed")
+            with closing(sqlite3.connect(self.audit)) as db, db:
+                self.assertEqual(db.execute("SELECT id FROM warden_events ORDER BY id").fetchall(),
+                                 [(1,), (2,), (6,), (7,)])
+                db.execute("UPDATE warden_events SET at=datetime('now','-2 hours') WHERE id=2")
+            with self.assertRaises(PermissionError):
+                self.client.event(*SCOPE, "closed")
+            with closing(sqlite3.connect(self.audit)) as db:
+                self.assertEqual(db.execute("SELECT id FROM warden_events ORDER BY id").fetchall(),
+                                 [(1,), (7,), (8,)])
 
     def test_each_authorization_rechecks_policy_and_database_files(self):
         self.assertEqual(self.audit.stat().st_mode & 0o777, 0o600)

@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
+from functools import partial
 import json
 import os
 import signal
@@ -112,7 +113,8 @@ async def serve(args):
             worker.exception()
 
     runtime = PluginRuntime(args.plugin_manifest, args.core)
-    async with PluginHost(args.plugins, state, args.task, client.plugin_grant, client.event, runtime) as host:
+    async with PluginHost(args.plugins, state, args.task, client.plugin_grant, client.event, runtime,
+                          session_grant=partial(client.plugin_grant, session_check=True)) as host:
         def accept(reader, writer):
             if len(workers) >= 32 or stopped.is_set():
                 writer.close()

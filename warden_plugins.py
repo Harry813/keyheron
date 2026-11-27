@@ -1,6 +1,7 @@
 """Trusted, task-scoped Warden connectors. Agent inputs select names, never destinations."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 import os
@@ -15,7 +16,7 @@ from agent_access import load_config, unlock_policy_store
 from dbproxy import read_password
 from plugin_runtime import PluginRuntime, trusted_json
 from dbproxy.session import database_audit, run_session
-from warden_control import FIELDS, valid_id
+from warden_control import ControlBusy, FIELDS, valid_id
 
 
 DB_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -107,12 +108,13 @@ class _DatabaseSession:
 
 
 class PluginHost:
-    def __init__(self, config_path, state_dir, task, authorize, event, runtime=None):
+    def __init__(self, config_path, state_dir, task, authorize, event, runtime=None, *, session_grant=None):
         self.runtime = runtime or PluginRuntime()
         self.catalog = _load_catalog(Path(config_path), self.runtime)
         self.state_dir = Path(state_dir).resolve()
         self.task = task
         self.authorize = authorize
+        self.session_grant = session_grant
         self.event = event
         self.sessions = {}
         self.running = False
@@ -122,6 +124,10 @@ class PluginHost:
         info = self.state_dir.stat()
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise ValueError("Warden 状态目录须由当前账户独占")
+        # Ordinary Agent work can occupy the default executor. Only active database
+        # sessions submit to these two pools, bounding queued jobs by MAX_SESSIONS.
+        self.session_checks = ThreadPoolExecutor(max_workers=4, thread_name_prefix="warden-check")
+        self.close_reports = ThreadPoolExecutor(max_workers=2, thread_name_prefix="warden-close")
         self.running = True
         return self
 
@@ -131,14 +137,21 @@ class PluginHost:
         for session in sessions:
             session.stop.set()
         await asyncio.gather(*(session.worker for session in sessions), return_exceptions=True)
+        for executor in (self.session_checks, self.close_reports):
+            await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
 
     def available(self, connector, action, resource):
         plugin = self.runtime.plugins.get(connector)
         return bool(plugin and plugin["action"] == action and resource in self.catalog.get(connector, {}))
 
-    async def _grant(self, operation):
+    async def _grant(self, operation, *, session_check=False):
         started = time.monotonic()
-        grant = await asyncio.to_thread(self.authorize, self.task, *operation)
+        authorize = self.session_grant if session_check and self.session_grant is not None else self.authorize
+        if session_check:
+            loop = asyncio.get_running_loop()
+            grant = await loop.run_in_executor(self.session_checks, authorize, self.task, *operation)
+        else:
+            grant = await asyncio.to_thread(authorize, self.task, *operation)
         expected = dict(zip(FIELDS, (self.task, *operation)))
         ttl = grant.get("ttl")
         if (grant.get("scope") != expected or type(ttl) is not int or not 1 <= ttl <= 900
@@ -147,7 +160,11 @@ class PluginHost:
         return started + ttl, grant["scope"]
 
     async def _event(self, operation, result):
-        await asyncio.to_thread(self.event, self.task, *operation, result)
+        if result == "closed":
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self.close_reports, self.event, self.task, *operation, result)
+        else:
+            await asyncio.to_thread(self.event, self.task, *operation, result)
 
     async def invoke(self, connector, action, resource):
         operation = (connector, action, resource)
@@ -181,7 +198,7 @@ class PluginHost:
                     break
                 await asyncio.sleep(min(CHECK_INTERVAL, remaining))
                 async with asyncio.timeout(min(CHECK_INTERVAL, deadline - time.monotonic())):
-                    renewed_deadline, _ = await self._grant(operation)
+                    renewed_deadline, _ = await self._grant(operation, session_check=True)
                     deadline = min(deadline, renewed_deadline)
         except Exception:
             # Denial, timeout and control-plane failure all terminate the live native stream.
@@ -249,6 +266,9 @@ class PluginHost:
             raise PermissionError("数据库会话已结束")
         try:
             await self._grant(session.operation)
+        except ControlBusy:
+            # Reject only this stream open; the independent watchdog still checks the live session.
+            raise
         except Exception:
             session.stop.set()
             raise

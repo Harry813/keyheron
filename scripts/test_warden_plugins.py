@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dbproxy.session import local_tls
 from warden_client import serve_one_database
+from warden_control import ControlBusy
 from warden_plugins import PluginHost
 
 
@@ -178,9 +179,17 @@ class WardenPlugins(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(list(self.root.rglob("connection.json")))
                     with patch("warden_plugins.MAX_SESSIONS", 1), self.assertRaises(RuntimeError):
                         await host.invoke("mysql", "connect", "orders")
+                    host.session_grant = self.grant
                     actual_port = info["port"]
                     info.update(port=1, host="untrusted.invalid")
                     reader, writer = await host.open_database_stream(info)
+                    def ordinary_busy(*_):
+                        raise ControlBusy("ordinary budget exhausted")
+
+                    host.authorize = ordinary_busy
+                    with self.assertRaises(ControlBusy):
+                        await host.open_database_stream(info)
+                    self.assertFalse(host.sessions[info["session_id"]].stop.is_set())
                     ping = b"\x01\x00\x00\x00\x0e"  # Classic COM_PING frame
                     writer.write(info["password"].encode() + b"\n" + ping)
                     await writer.drain()
