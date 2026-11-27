@@ -165,6 +165,37 @@ class ConnectorSessionTests(unittest.IsolatedAsyncioTestCase):
                 await pending
             await asyncio.wait_for(ended.get(), 2)
 
+    async def test_explicit_close_unpublishes_before_waiting_for_warden_eof(self):
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        async def warden(reader, writer):
+            try:
+                await reader.readline()
+                expires = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
+                writer.write(json.dumps({"result": {"expires_at": expires},
+                                         "transport": "database-stream"}).encode() + b"\n")
+                await writer.drain()
+                self.assertEqual(await reader.read(1), b"")
+                closing.set()
+                await release.wait()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            socket_path = Path(tmp, "task.sock")
+            async with await asyncio.start_unix_server(warden, socket_path):
+                async with warden_client.ConnectorSession(socket_path) as session:
+                    result = await session.invoke("postgresql", "connect", "orders")
+                    closed = asyncio.create_task(session.close_connection(result["handle"]))
+                    try:
+                        await asyncio.wait_for(closing.wait(), 1)
+                        self.assertFalse(Path(result["descriptor_path"]).exists())
+                        self.assertFalse(closed.done())
+                    finally:
+                        release.set()
+                        await asyncio.wait_for(closed, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

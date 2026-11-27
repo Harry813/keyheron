@@ -110,6 +110,29 @@ async def _stop_workers(workers):
             raise
 
 
+async def _close_stream(reader, writer, *, native):
+    try:
+        if native and not writer.is_closing() and not writer.transport.get_write_buffer_size():
+            # A write-side EOF also releases a Warden still waiting for the first SQL client.
+            # Give the peer time to finish its stream; discard any final native bytes locally.
+            async with asyncio.timeout(2):
+                writer.write_eof()
+                while await reader.read(65536):
+                    pass
+    except (ConnectionError, TimeoutError):
+        pass
+    finally:
+        if asyncio.current_task().cancelling():
+            writer.transport.abort()
+        else:
+            writer.close()
+        try:
+            async with asyncio.timeout(2):
+                await writer.wait_closed()
+        except (ConnectionError, TimeoutError):
+            writer.transport.abort()
+
+
 class ConnectorSession:
     """Sandbox-local client for one Warden socket; the context owns its live native bridges."""
 
@@ -218,15 +241,7 @@ class ConnectorSession:
         finally:
             try:
                 if writer is not None:
-                    if asyncio.current_task().cancelling():
-                        writer.transport.abort()
-                    else:
-                        writer.close()
-                    try:
-                        async with asyncio.timeout(2):
-                            await writer.wait_closed()
-                    except (ConnectionError, TimeoutError):
-                        writer.transport.abort()
+                    await _close_stream(reader, writer, native=handle is not None)
             finally:
                 if handle is not None:
                     self._connections.pop(handle, None)
