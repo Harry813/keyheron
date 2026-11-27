@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -16,6 +17,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dbproxy.session import local_tls
+from credential_store import initialize, unlock
 from warden_client import serve_one_database
 from warden_control import ControlBusy
 from warden_plugins import PluginHost
@@ -159,6 +161,98 @@ class WardenPlugins(unittest.IsolatedAsyncioTestCase):
                 broker.assert_not_called()
             self.assertFalse(host.sessions)
             self.assertEqual(self.events, [("review", "mysql", "connect", "orders", "failed")])
+
+    async def test_concurrent_vault_sessions_share_one_unlock_and_read_rotated_password(self):
+        vault = self.root / "vault"
+        phrase_file = self.root / "unlock"
+        phrase = b"fixture passphrase for vault"
+        phrase_file.write_bytes(phrase)
+        phrase_file.chmod(0o600)
+        db_file = self.root / "db.json"
+        config = json.loads(db_file.read_text())
+        target = config["environments"]["DEV"]["databases"]["orders-mysql"]
+        del target["password_file"]
+        target["password_ref"] = "db-login"
+        config["credential_store"] = {"path": "vault", "passphrase_file": "unlock"}
+        db_file.write_text(json.dumps(config))
+
+        async def session(target, ttl, directory, record, stop, *, on_ready):
+            on_ready({"engine": target["engine"]})
+            await stop.wait()
+
+        with (patch("credential_store._derive", side_effect=lambda p, s: hashlib.sha256(s + p).digest()) as derive,
+              patch("warden_plugins.run_session", side_effect=session)):
+            initialize(vault, phrase)
+            store = unlock(vault, phrase)
+            store.put("DEV", "db-login", b"first")
+            derive.reset_mock()
+            async with self.host() as host:
+                sessions = await asyncio.gather(*(host.invoke("mysql", "connect", "orders") for _ in range(4)))
+                self.assertEqual(derive.call_count, 1)
+                await asyncio.gather(*(host.close_database(s) for s in sessions))
+                from dbproxy import read_password
+                seen = []
+
+                def capture(target):
+                    seen.append(read_password(target))
+                    return seen[-1]
+
+                store.put("DEV", "db-login", b"second")
+                with patch("warden_plugins.read_password", side_effect=capture):
+                    await host.close_database(await host.invoke("mysql", "connect", "orders"))
+                self.assertEqual(seen, ["second"])
+                self.assertEqual(derive.call_count, 1)
+
+                phrase_file.write_bytes(b"wrong synthetic passphrase")
+                with self.assertRaises(RuntimeError):
+                    await host.invoke("mysql", "connect", "orders")
+                self.assertFalse(host.sessions)
+                phrase_file.unlink()
+                with self.assertRaises(RuntimeError):
+                    await host.invoke("mysql", "connect", "orders")
+                self.assertFalse(host.sessions)
+
+    def test_repeated_unsuccessful_unlocks_share_a_work_budget(self):
+        from warden_plugins import _VaultReaders
+        readers = _VaultReaders()
+        policy = {"credential_store": {"path": "vault", "passphrase_file": str(self.secret)}}
+        with (patch("credential_store.vault_identity", return_value=(1,)),
+              patch("warden_plugins.unlock_policy_store", side_effect=ValueError) as unlock_store,
+              patch("warden_plugins.time") as clock, patch("warden_plugins.VAULT_UNLOCKS_PER_SECOND", 1)):
+            clock.monotonic.return_value = 11
+            with self.assertRaises(ValueError):
+                readers.reader(policy, "DEV", "demo")
+            with self.assertRaises(RuntimeError):
+                readers.reader(policy, "DEV", "another")
+            self.assertEqual(unlock_store.call_count, 1)
+            clock.monotonic.return_value = 12
+            with self.assertRaises(ValueError):
+                readers.reader(policy, "DEV", "demo")
+            self.assertEqual(unlock_store.call_count, 2)
+
+    def test_cached_vault_reader_rechecks_replaced_vault_and_unlock_file_permissions(self):
+        from warden_plugins import _VaultReaders
+        readers = _VaultReaders()
+        vault = self.root / "vault"
+        phrase = b"synthetic fixture passphrase"
+        self.secret.write_bytes(phrase)
+        policy = {"credential_store": {"path": str(vault), "passphrase_file": str(self.secret)}}
+        with (patch("credential_store._derive", side_effect=lambda p, s: hashlib.sha256(s + p).digest()),
+              patch("warden_plugins.VAULT_UNLOCKS_PER_SECOND", 8)):
+            initialize(vault, phrase)
+            unlock(vault, phrase).put("DEV", "login", b"old")
+            previous = readers.reader(policy, "DEV", "login")
+            self.assertEqual(previous(), b"old")
+            replacement = vault.with_suffix(".new")
+            initialize(replacement, phrase)
+            unlock(replacement, phrase).put("DEV", "login", b"new")
+            replacement.replace(vault)
+            with self.assertRaises(ValueError):
+                previous()
+            self.assertEqual(readers.reader(policy, "DEV", "login")(), b"new")
+            self.secret.chmod(0o644)
+            with self.assertRaises(ValueError):
+                readers.reader(policy, "DEV", "login")
 
     async def test_revoke_open_stream_and_release(self):
         async def echo(reader, writer):

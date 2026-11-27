@@ -88,12 +88,17 @@ def initialize(path, passphrase: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def vault_identity(path):
+    """The vault header stays stable when individual credential entries rotate."""
+    with _database(Path(path).absolute()) as db:
+        return _meta(db)
+
+
 def unlock(path, passphrase: bytes):
     if not isinstance(passphrase, bytes) or not passphrase:
         raise ValueError("需要凭据库主口令")
     path = Path(path).absolute()
-    with _database(path) as db:
-        metadata = _meta(db)
+    metadata = vault_identity(path)
     _, salt, nonce, verifier = metadata
     master = _derive(passphrase, salt)
     try:
