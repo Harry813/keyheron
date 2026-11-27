@@ -2,63 +2,52 @@
 
 import argparse
 from contextlib import closing
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
-import subprocess
 import sys
 import tempfile
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_KEY = "KEYHERON_TEST_INSTALLATION_TOKEN"
 ROUTE = "/installation/repositories"
-URL = "https://api.github.com" + ROUTE
 MAX_RESPONSE = 8 * 1024 * 1024
 
 
-def check_client(repository):
-    # The unmodified urllib client knows only the API address; proxy auth and CA
-    # come from KeyHeron. Never echo the response, repository list or environment.
-    if any(
-        name in os.environ
-        for name in (ENV_KEY, "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN")
-    ):
-        return 1
-    if os.environ.get("KEYHERON_URL") != URL or not os.environ.get("HTTPS_PROXY"):
-        return 1
-    request = Request(URL, headers={"Accept": "application/vnd.github+json"})
-    try:
-        with urlopen(request, timeout=20) as response:
+def verify_installation_scope(repository, installation_token):
+    # The trusted CI process checks the repository list directly. No redirects or
+    # proxy forwarding, and no raw response or credential reaches an SDK client.
+    with closing(http.client.HTTPSConnection("api.github.com", timeout=20)) as conn:
+        conn.request("GET", ROUTE, headers={
+            "Authorization": "Bearer " + installation_token,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "KeyHeron-acceptance",
+        })
+        with conn.getresponse() as response:
+            if response.status != 200:
+                raise RuntimeError("GitHub installation scope request failed")
             body = response.read(MAX_RESPONSE + 1)
-            if response.status != 200 or len(body) > MAX_RESPONSE:
-                return 1
-            value = json.loads(body)
-            # This check is intended for a token explicitly restricted to this repo.
-            repos = value.get("repositories", [])
-            if (
-                value.get("total_count") != 1
-                or len(repos) != 1
-                or repos[0].get("full_name", "").casefold() != repository.casefold()
-            ):
-                return 1
-            print("HTTP 200")
-            return 0
-    except HTTPError as exc:
-        print(f"HTTP {exc.code}")
-    except (OSError, URLError, ValueError, AttributeError, TypeError):
-        pass
-    return 1
+    if len(body) > MAX_RESPONSE:
+        raise ValueError("installation scope response too large")
+    value = json.loads(body)
+    repos = value.get("repositories") if isinstance(value, dict) else None
+    if (
+        not isinstance(repos, list) or len(repos) != 1 or value.get("total_count") != 1
+        or not isinstance(repos[0], dict) or not isinstance(repos[0].get("full_name"), str)
+        or repos[0]["full_name"].casefold() != repository.casefold()
+    ):
+        raise ValueError("installation token is not restricted to the expected repository")
 
 
 def verify(repository, installation_token):
     sys.path.insert(0, str(ROOT))
-    from agent_access import running_external
+    from agent_access import control, running_external
 
+    verify_installation_scope(repository, installation_token)
     with tempfile.TemporaryDirectory(prefix="keyheron-github-") as tmp:
         base = Path(tmp)
         base.chmod(0o700)
@@ -98,68 +87,35 @@ def verify(repository, installation_token):
         )
         config.chmod(0o600)
         state = base / "state"
-        with running_external(config, state):
-            # Pass inert markers to the trusted CLI to exercise its child-env filter,
-            # without giving that CLI the upstream token used for this test.
-            cli_env = {
-                k: os.environ[k]
-                for k in ("PATH", "LANG", "LC_ALL", "TERM", "TZ", "TMPDIR")
-                if k in os.environ
-            }
-            cli_env.update(
-                {
-                    ENV_KEY: "must-stay-at-launcher",
-                    "GITHUB_TOKEN": "must-stay-at-launcher",
-                }
-            )
-            run = subprocess.run(
-                [
-                    sys.executable,
-                    "-B",
-                    str(ROOT / "keyheron.py"),
-                    "run",
-                    "--state-dir",
-                    str(state),
-                    "--env",
-                    "DEV",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(Path(__file__).resolve()),
-                    "--client",
-                    "--repository",
-                    repository,
-                ],
-                env=cli_env,
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-            if run.returncode != 0 or run.stdout.strip() != "HTTP 200":
-                indicator = run.stdout.strip()
-                if re.fullmatch(r"HTTP [1-5][0-9]{2}", indicator):
-                    print(indicator, file=sys.stderr)
-                raise RuntimeError(
-                    "GitHub SDK read failed or token was not restricted to the requested repository"
-                )
+        with running_external(config, state) as info:
+            control(info, "switch", {"environment": "DEV"})
+            try:
+                control(info, "sdk-session", {"environment": "DEV", "ttl": 60})
+            except RuntimeError as exc:
+                if not str(exc).startswith("sdk-session: HTTP 403 "):
+                    raise
+            else:
+                raise RuntimeError("SDK session unexpectedly issued for a bearer credential")
+            metadata = control(info, "read", {})
+            if metadata != {
+                "environment": "DEV",
+                "account": "ci-installation",
+                "status_source": "configured-credential",
+                "upstream_status": 200,
+                "operation_id": None,
+            }:
+                raise RuntimeError("unexpected managed read metadata")
         with closing(sqlite3.connect(state / "events.sqlite3")) as db:
-
-            def recorded(action, actor):
-                return db.execute(
-                    "SELECT COUNT(*) FROM events WHERE environment='DEV' AND action=? AND actor=? AND result='allowed'",
-                    (action, actor),
-                ).fetchone()[0]
-
-            if (
-                recorded("sdk_read", "agent") != 1
-                or recorded("sdk-session", "ci-agent") != 1
-                or recorded("sdk-revoke", "ci-agent") != 1
-            ):
-                raise RuntimeError("expected credential-proxy audit lifecycle missing")
-    print(
-        "PASS: scoped GitHub installation read, HTTP 200, SDK credential isolation and audit"
-    )
+            events = db.execute(
+                "SELECT actor, environment, action, resource, result FROM events "
+                "WHERE action IN ('sdk-session', 'sdk_read', 'read') ORDER BY id"
+            ).fetchall()
+            if events != [
+                ("ci-agent", "DEV", "sdk-session", "installation-repository", "denied"),
+                ("ci-agent", "DEV", "read", "installation-repository", "allowed"),
+            ]:
+                raise RuntimeError("expected managed read and denied SDK issuance audit missing")
+    print("PASS: single-repository GitHub token, managed read metadata, SDK refusal and audit")
 
 
 def main():
@@ -169,10 +125,7 @@ def main():
         default=os.environ.get("GITHUB_REPOSITORY", ""),
         help="expected owner/repository",
     )
-    parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.client:
-        return check_client(args.repository)
     if os.environ.get("GITHUB_ACTIONS") == "true" and (
         os.environ.get("GITHUB_EVENT_NAME") != "push"
         or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
@@ -195,9 +148,9 @@ def main():
         ValueError,
         RuntimeError,
         sqlite3.Error,
-        subprocess.TimeoutExpired,
+        http.client.HTTPException,
     ) as exc:
-        # No exception or child stderr is echoed: it may contain credential-bearing URLs or data.
+        # Exceptions and upstream responses can contain private data.
         print(f"FAIL: GitHub acceptance ({type(exc).__name__})", file=sys.stderr)
         return 1
     return 0

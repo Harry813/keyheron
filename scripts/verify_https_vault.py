@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent_access import control, running_external
 from credential_store import initialize, unlock
-from verify_external import Fixture, READ, curl, make_ca
+from verify_external import Fixture, READ, make_ca
 
 
 def verify(root, core=None):
@@ -46,23 +46,37 @@ def verify(root, core=None):
         derived_key = store.binding("DEV", "api-secret")["key"].encode()
         with running_external(policy, state, core=core) as info:
             control(info, "switch", {"environment": "DEV"})
-            session = control(info, "sdk-session", {"environment": "DEV"})
+            before = origin.arrivals
+            try:
+                control(info, "sdk-session", {"environment": "DEV"})
+            except RuntimeError as exc:
+                assert "HTTP 403" in str(exc)
+            else:
+                raise AssertionError("header credential unexpectedly admitted an SDK session")
+            assert origin.arrivals == before
 
             def fetch():
-                return curl(info, session, "DEV", origin.origin + READ)
+                result = control(info, "read", {})
+                assert result["upstream_status"] == 200
+                assert "private-fixture" not in json.dumps(result)
 
-            assert fetch()[0] == (200, 200)
+            fetch()
             rotated = secrets.token_urlsafe(32).encode()
             store.put("DEV", "api-secret", rotated)
             origin.keys["reader"] = rotated.decode()
-            assert fetch()[0] == (200, 200), "rotated credential not recognized"
+            fetch()
             assert origin.authenticated == ["reader", "reader"]
             with closing(sqlite3.connect(vault)) as db, db:
                 db.execute("UPDATE vault_credentials SET ciphertext=zeroblob(length(ciphertext)) WHERE ref=?",
                            ("DEV/api-secret",))
             count = origin.arrivals
-            status, error = fetch()
-            assert status[-1] >= 400 and origin.arrivals == count, "tampered record reached upstream"
+            try:
+                fetch()
+            except RuntimeError as exc:
+                error = str(exc)
+            else:
+                raise AssertionError("tampered record accepted")
+            assert origin.arrivals == count, "tampered record reached upstream"
             for secret in (first, rotated, derived_key, passphrase):
                 assert secret not in error.encode()
                 assert secret not in json.dumps(info).encode()

@@ -33,19 +33,16 @@ def check(condition, description):
         raise AssertionError(description)
 
 
+def run_openssl(directory, *args):
+    subprocess.run(
+        ["openssl", *args], cwd=directory, check=True, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, timeout=20,
+    )
+
+
 def make_ca(directory):
     """Generate a fixture CA and a localhost server certificate; never modify host trust."""
     directory.mkdir(mode=0o700)
-
-    def openssl(*args):
-        subprocess.run(
-            ["openssl", *args],
-            cwd=directory,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=20,
-        )
 
     # A machine-wide openssl.cnf may already define CA extensions. An isolated
     # config avoids duplicate extension OIDs without weakening certificate validation.
@@ -57,16 +54,18 @@ def make_ca(directory):
     (directory / "leaf.cnf").write_text(
         "[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=localhost\n"
     )
-    openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "root.key")
-    openssl("req", "-x509", "-new", "-sha256", "-key", "root.key", "-config",
-            "root.cnf", "-days", "2", "-out", "root.pem")
-    openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "server.key")
-    openssl("req", "-new", "-sha256", "-key", "server.key", "-config", "leaf.cnf", "-out", "server.csr")
+    run_openssl(directory, "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "root.key")
+    run_openssl(directory, "req", "-x509", "-new", "-sha256", "-key", "root.key", "-config",
+                "root.cnf", "-days", "2", "-out", "root.pem")
+    run_openssl(directory, "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "server.key")
+    run_openssl(directory, "req", "-new", "-sha256", "-key", "server.key", "-config", "leaf.cnf",
+                "-out", "server.csr")
     (directory / "ext").write_text(
         "basicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost\n"
         "extendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n"
     )
-    openssl(
+    run_openssl(
+        directory,
         "x509",
         "-req",
         "-sha256",
@@ -84,14 +83,36 @@ def make_ca(directory):
         "-extfile",
         "ext",
     )
-    openssl("verify", "-purpose", "sslserver", "-CAfile", "root.pem", "server.pem")
+    run_openssl(directory, "verify", "-purpose", "sslserver", "-CAfile", "root.pem", "server.pem")
+
+
+def client_identity(directory, role):
+    name = f"client-{role}"
+    (directory / "client.ext").write_text(
+        "basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\nkeyUsage=critical,digitalSignature\n"
+    )
+    (directory / "client.cnf").write_text(
+        f"[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN={role}\n"
+    )
+    run_openssl(directory, "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", f"{name}.key")
+    run_openssl(directory, "req", "-new", "-key", f"{name}.key", "-config",
+                "client.cnf", "-out", f"{name}.csr")
+    run_openssl(directory, "x509", "-req", "-sha256", "-in", f"{name}.csr", "-CA", "root.pem",
+                "-CAkey", "root.key", "-CAcreateserial", "-days", "1", "-extfile",
+                "client.ext", "-out", f"{name}.crt")
+    path = directory / f"{name}.pem"
+    path.touch(mode=0o600)
+    path.write_bytes((directory / f"{name}.crt").read_bytes() + (directory / f"{name}.key").read_bytes())
+    return path
 
 
 class Fixture:
-    def __init__(self, directory, environment):
+    def __init__(self, directory, environment, *, mtls=False):
         self.environment = environment
         self.directory = directory
-        self.keys = {
+        self.mtls = mtls
+        self.client_identities = {}
+        self.keys = {} if mtls else {
             r: secrets.token_hex(32) for r in ("reader", "inspector", "worker")
         }
         self.authenticated = []
@@ -136,14 +157,15 @@ class Fixture:
                 "credential": "worker",
                 "body": FIXED_BODY,
                 "max_ttl": 60,
-                "auth_header": "X-Test-API-Key",
-                "auth_scheme": "",
                 "idempotency_supported": True,
             }
+            if not self.mtls:
+                routes["retry"].update(auth_header="X-Test-API-Key", auth_scheme="")
         return {
             "origin": self.origin,
             "ca_file": str(cert_path),
-            "credential_files": keys,
+            **({"client_identities": {r: str(p) for r, p in self.client_identities.items()}}
+               if self.mtls else {"credential_files": keys}),
             "routes": routes,
         }
 
@@ -157,6 +179,20 @@ class Fixture:
             def log_message(self, *_):
                 pass
 
+            def authenticated_as(self, role):
+                if not role:
+                    return False
+                if fixture.mtls:
+                    subject = self.connection.getpeercert()["subject"]
+                    names = [value for rdn in subject for name, value in rdn if name == "commonName"]
+                    return names == [role] and all(
+                        name not in self.headers
+                        for name in ("Authorization", "X-Test-API-Key", "Proxy-Authorization")
+                    )
+                if role == "worker":
+                    return self.headers.get("X-Test-API-Key") == fixture.keys[role]
+                return self.headers.get("Authorization") == "Bearer " + fixture.keys[role]
+
             def serve(self):
                 role = {
                     ("GET", READ): "reader",
@@ -166,21 +202,12 @@ class Fixture:
                 data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 with fixture.lock:
                     fixture.arrivals += 1
+                    ok = self.authenticated_as(role)
                     if role == "worker":
                         op = self.headers.get("Idempotency-Key")
-                        ok = (
-                            self.headers.get("X-Test-API-Key") == fixture.keys["worker"]
-                            and op
-                            and json.loads(data) == FIXED_BODY
-                        )
+                        ok = ok and op and json.loads(data) == FIXED_BODY
                         if ok:
                             fixture.operations.add(op)
-                    else:
-                        ok = (
-                            role
-                            and self.headers.get("Authorization")
-                            == "Bearer " + fixture.keys[role]
-                        )
                     gate = fixture.next_response_gate if ok else None
                     if gate is not None:
                         fixture.next_response_gate = None
@@ -217,6 +244,11 @@ class Fixture:
 
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(cert_dir / "server.pem", cert_dir / "server.key")
+        if self.mtls:
+            roles = ("reader", "inspector", "worker") if self.environment == "PROD" else ("reader",)
+            self.client_identities = {role: client_identity(cert_dir, role) for role in roles}
+            tls.load_verify_locations(cafile=str(cert_dir / "root.pem"))
+            tls.verify_mode = ssl.CERT_REQUIRED
         with Server(("127.0.0.1", 0), self.handler()) as server:
             server.socket = tls.wrap_socket(server.socket, server_side=True)
             self.port = server.server_port
@@ -298,6 +330,7 @@ def bench_tls(info, session, fixture, origin_ca, samples):
     target = urlsplit(fixture.origin)
     client_ca = ssl.create_default_context(cafile=str(info["ca_file"]))
     upstream_ca = ssl.create_default_context(cafile=str(origin_ca))
+    upstream_ca.load_cert_chain(fixture.client_identities["reader"])
     proxy_auth = (
         "Basic " + base64.b64encode(("agent:" + session["token"]).encode()).decode()
     )
@@ -321,18 +354,13 @@ def bench_tls(info, session, fixture, origin_ca, samples):
 
         def lane(n):
             conn = connection()
-            hdr = (
-                {}
-                if kind == "sdk"
-                else {"Authorization": "Bearer " + fixture.keys["reader"]}
-            )
             times = []
             try:
                 for i in range(n + 2):
                     if cold:
                         conn.close()
                     now = time.perf_counter_ns()
-                    conn.request("GET", READ, headers=hdr)
+                    conn.request("GET", READ)
                     resp = conn.getresponse()
                     raw = resp.read()
                     elapsed = (time.perf_counter_ns() - now) / 1e6
@@ -382,7 +410,7 @@ def bench_tls(info, session, fixture, origin_ca, samples):
         "TLS benchmark request reconciliation failed",
     )
     return {
-        "scope": "local HTTPS + verified ephemeral CA on both legs, synthetic secrets, HTTP/1.1; "
+        "scope": "local HTTPS + verified ephemeral CA on both legs, upstream mTLS, HTTP/1.1; "
         "cold=new TCP/TLS connection to proxy for each operation; broker retains its upstream pool",
         "observed_upstream_gets": fixture.arrivals - before,
         "errors": 0,
@@ -398,8 +426,8 @@ def verify(core=None, samples=0):
         root = Path(tmp)
         for name in ("ca-one", "ca-two"):
             make_ca(root / name)
-        dev = stack.enter_context(Fixture(root, "DEV").start(root / "ca-one"))
-        prod = stack.enter_context(Fixture(root, "PROD").start(root / "ca-two"))
+        dev = stack.enter_context(Fixture(root, "DEV", mtls=True).start(root / "ca-one"))
+        prod = stack.enter_context(Fixture(root, "PROD", mtls=True).start(root / "ca-two"))
         conf = {
             "version": 1,
             "task": "external-service-demo",
@@ -579,8 +607,7 @@ def verify(core=None, samples=0):
                 s["token"]
                 for s in (dev_session, standalone, expiring, old, stg, prod_session)
             ),
-            *dev.keys.values(),
-            *prod.keys.values(),
+            "-----BEGIN EC PRIVATE KEY-----",
         ]
         check(
             not any(t in audit_text for t in tokens),

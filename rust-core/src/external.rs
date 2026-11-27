@@ -18,7 +18,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::{net::TcpListener, time::timeout};
@@ -50,6 +52,8 @@ pub struct ExternalEnvironment {
     pub credential_files: HashMap<String, PathBuf>,
     #[serde(default)]
     pub credential_bindings: HashMap<String, Binding>,
+    #[serde(default)]
+    pub client_identities: HashMap<String, PathBuf>,
     pub routes: HashMap<String, Route>,
     pub ca_file: Option<PathBuf>,
     pub proxy_cert_file: PathBuf,
@@ -87,12 +91,35 @@ fn safe_label(s: &str) -> bool {
     !s.is_empty() && s.len() <= 192 && s.chars().all(|c| !c.is_control())
 }
 
+fn client_identity(path: &Path) -> Result<reqwest::Identity> {
+    const MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .context("无法读取上游客户端身份")?;
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file() && meta.mode() & 0o077 == 0
+            && (meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() }),
+        "上游客户端身份必须是可信账户独占的普通文件"
+    );
+    let mut pem = Zeroizing::new(Vec::new());
+    file.take(MAX_IDENTITY_BYTES + 1).read_to_end(&mut pem)?;
+    ensure!(
+        pem.len() as u64 <= MAX_IDENTITY_BYTES,
+        "上游客户端身份文件过大"
+    );
+    reqwest::Identity::from_pem(&pem).context("上游客户端身份 PEM 无效")
+}
+
 struct Target {
     config: ExternalEnvironment,
     origin: Url,
     authority: String,
     host_header: String,
     upstream: Client,
+    identity_clients: HashMap<String, Client>,
     acceptor: TlsAcceptor,
 }
 
@@ -125,6 +152,11 @@ enum ResponseUse {
 
 impl Target {
     fn new(environment: &str, config: ExternalEnvironment) -> Result<Self> {
+        ensure!(
+            config.client_identities.is_empty()
+                || (config.credential_files.is_empty() && config.credential_bindings.is_empty()),
+            "客户端证书和请求头凭据不能用于同一环境"
+        );
         for (alias, binding) in &config.credential_bindings {
             ensure!(
                 !config.credential_files.contains_key(alias),
@@ -171,12 +203,18 @@ impl Target {
             );
             ensure!(
                 config.credential_files.contains_key(&route.credential)
-                    || config.credential_bindings.contains_key(&route.credential),
+                    || config.credential_bindings.contains_key(&route.credential)
+                    || config.client_identities.contains_key(&route.credential),
                 "路由引用了未声明的凭据"
             );
             let name = header::HeaderName::from_bytes(route.auth_header.as_bytes())
                 .context("认证请求头名称无效")?;
             let n = name.as_str();
+            ensure!(
+                config.client_identities.is_empty()
+                    || (n == "authorization" && route.auth_scheme == "Bearer"),
+                "使用客户端证书的路由不能自定义认证请求头"
+            );
             ensure!(
                 (n == "authorization" || n == "api-key" || n.starts_with("x-"))
                     && !n.starts_with("x-forwarded-")
@@ -210,23 +248,35 @@ impl Target {
                 );
             }
         }
-        let mut client = Client::builder()
-            .use_rustls_tls()
-            .https_only(true)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("KeyHeron/0.1");
-        if let Some(ca) = &config.ca_file {
+        let roots = if let Some(ca) = &config.ca_file {
             let certs = reqwest::Certificate::from_pem_bundle(
                 &std::fs::read(ca).context("无法读取该环境的上游根证书")?,
             )?;
             ensure!(!certs.is_empty(), "上游根证书文件为空");
-            for cert in certs {
-                client = client.add_root_certificate(cert);
+            certs
+        } else {
+            Vec::new()
+        };
+        let client = || {
+            let mut builder = Client::builder()
+                .use_rustls_tls()
+                .https_only(true)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_secs(15))
+                .connect_timeout(Duration::from_secs(5))
+                .user_agent("KeyHeron/0.1");
+            for cert in &roots {
+                builder = builder.add_root_certificate(cert.clone());
             }
+            builder
+        };
+        // Never share TLS connections across upstream identities.
+        let mut identity_clients = HashMap::new();
+        for (name, path) in &config.client_identities {
+            let upstream = client().identity(client_identity(path)?).build()?;
+            identity_clients.insert(name.clone(), upstream);
         }
         let certs = CertificateDer::pem_file_iter(&config.proxy_cert_file)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -243,7 +293,8 @@ impl Target {
             origin,
             authority,
             host_header,
-            upstream: client.build()?,
+            upstream: client().build()?,
+            identity_clients,
             acceptor: TlsAcceptor::from(Arc::new(tls)),
         })
     }
@@ -288,37 +339,47 @@ impl Target {
         response_use: ResponseUse,
     ) -> Result<Reply> {
         let route = self.config.routes.get(kind).context("环境未配置此动作")?;
-        let raw = self.credential(&route.credential).await?;
-        let secret = std::str::from_utf8(&raw)
-            .context("凭据格式无效")?
-            .trim_end_matches(['\r', '\n']);
+        let identity = self.identity_clients.get(&route.credential);
+        let include_body = matches!(&response_use, ResponseUse::Sdk(_));
         ensure!(
-            !secret.is_empty() && secret.bytes().all(|b| (33..=126).contains(&b)),
-            "凭据应为单个非空 Bearer token"
+            !include_body || identity.is_some(),
+            "SDK 原始响应要求上游客户端证书认证"
         );
         let mut url = self.origin.clone();
         url.set_path(&route.path);
         let method = Method::from_bytes(route.method.as_bytes())?;
-        let mut value = HeaderValue::from_str(&if route.auth_scheme.is_empty() {
-            secret.to_owned()
-        } else {
-            format!("{} {secret}", route.auth_scheme)
-        })
-        .context("凭据不能用于请求头")?;
-        value.set_sensitive(true);
-        let include_body = matches!(&response_use, ResponseUse::Sdk(_));
         let accept = match response_use {
             ResponseUse::Metadata => None,
             ResponseUse::Sdk(accept) => accept,
         };
-        let mut request = self
-            .upstream
+        let mut request = identity
+            .unwrap_or(&self.upstream)
             .request(method, url)
-            .header(route.auth_header.as_str(), value)
             .header(
                 header::ACCEPT,
                 accept.unwrap_or_else(|| HeaderValue::from_static("application/json")),
             );
+        let raw;
+        let mut credential_bytes = None;
+        if identity.is_none() {
+            raw = self.credential(&route.credential).await?;
+            let secret = std::str::from_utf8(&raw)
+                .context("凭据格式无效")?
+                .trim_end_matches(['\r', '\n']);
+            ensure!(
+                !secret.is_empty() && secret.bytes().all(|b| (33..=126).contains(&b)),
+                "凭据应为单个非空 Bearer token"
+            );
+            let mut value = if route.auth_scheme.is_empty() {
+                HeaderValue::from_str(secret)
+            } else {
+                HeaderValue::from_str(&format!("{} {secret}", route.auth_scheme))
+            }
+            .context("凭据不能用于请求头")?;
+            value.set_sensitive(true);
+            request = request.header(route.auth_header.as_str(), value);
+            credential_bytes = Some(secret.as_bytes());
+        }
         if kind == "retry" {
             let key = Uuid::parse_str(op.context("缺少操作编号")?).context("无效的操作编号")?;
             request = request.header("idempotency-key", key.to_string());
@@ -334,11 +395,7 @@ impl Target {
         let mime = resp
             .headers()
             .get(header::CONTENT_TYPE)
-            .filter(|v| {
-                !v.as_bytes()
-                    .windows(secret.len())
-                    .any(|s| s == secret.as_bytes())
-            })
+            .filter(|_| include_body)
             .cloned();
         // Never mirror upstream error payloads, redirect targets, cookies or authentication headers.
         if !(200..300).contains(&status) {
@@ -361,8 +418,6 @@ impl Target {
         );
         let mut bytes = Vec::new();
         let mut received = 0usize;
-        let contains_secret =
-            |data: &[u8]| data.windows(secret.len()).any(|s| s == secret.as_bytes());
         while let Some(chunk) = resp
             .chunk()
             .await
@@ -370,17 +425,20 @@ impl Target {
         {
             received = received.saturating_add(chunk.len());
             ensure!(received <= MAX_BYTES, "上游响应太大");
-            bytes.extend_from_slice(&chunk);
-            if !include_body {
-                ensure!(!contains_secret(&bytes), "上游响应包含凭据，已拒绝返回");
+            if include_body {
+                bytes.extend_from_slice(&chunk);
+            } else if let Some(secret) = credential_bytes {
+                bytes.extend_from_slice(&chunk);
+                ensure!(
+                    !bytes.windows(secret.len()).any(|w| w == secret),
+                    "上游响应包含凭据，已拒绝返回"
+                );
                 // Only the suffix can still match a credential split across two chunks.
                 let discard = bytes.len().saturating_sub(secret.len() - 1);
                 bytes.drain(..discard);
             }
         }
-        if include_body {
-            ensure!(!contains_secret(&bytes), "上游响应包含凭据，已拒绝返回");
-        } else {
+        if !include_body {
             bytes.clear();
         }
         Ok(Reply {
@@ -399,7 +457,13 @@ impl External {
             "需要一至三个环境"
         );
         let mut targets = HashMap::new();
+        let mut sdk_mode = None;
         for (env, cfg) in config.environments {
+            let mtls = !cfg.client_identities.is_empty();
+            ensure!(
+                sdk_mode.replace(mtls).is_none_or(|previous| previous == mtls),
+                "同一任务不能混用可复用请求头凭据与 SDK 客户端证书，请分开运行"
+            );
             ensure!(matches!(env.as_str(), "DEV" | "STG" | "PROD"), "未知环境");
             let target = Target::new(&env, cfg)?;
             targets.insert(env, target);
@@ -412,6 +476,10 @@ impl External {
         })
     }
 
+    pub fn supports_sdk(&self, env: &str) -> bool {
+        self.targets.get(env).is_some_and(|t| !t.identity_clients.is_empty())
+    }
+
     pub fn issue(&self, env: &str, kind: &str, ttl: u64, sdk_id: Option<&str>) -> Result<String> {
         let route = self
             .targets
@@ -420,6 +488,10 @@ impl External {
             .context("环境未配置该能力")?;
         ensure!((1..=route.max_ttl).contains(&ttl), "授权超过配置的有效期");
         if let Some(id) = sdk_id {
+            ensure!(
+                self.supports_sdk(env),
+                "SDK 原始响应要求上游客户端证书认证"
+            );
             ensure!(
                 kind == "read" && Uuid::parse_str(id).is_ok(),
                 "SDK 仅支持只读能力"
