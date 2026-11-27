@@ -23,6 +23,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::{net::TcpListener, time::timeout};
 use tokio_rustls::{
     rustls::{
@@ -35,6 +36,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SDK_PAYLOADS: usize = 4;
 const DENIAL_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Deserialize)]
@@ -136,7 +138,27 @@ pub struct External {
     task: String,
     targets: HashMap<String, Target>,
     sessions: Mutex<HashMap<String, Ticket>>,
+    sdk_payload_slots: Arc<Semaphore>,
     anonymous_denials: Arc<Mutex<Option<u64>>>,
+}
+
+// Hyper may retain or slice a frame after the handler returns. Tie the permit
+// to the bytes themselves so a slow client keeps its share of the payload budget.
+struct SdkPayload {
+    bytes: Bytes,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl SdkPayload {
+    fn retain_slot(bytes: Bytes, slot: OwnedSemaphorePermit) -> Bytes {
+        Bytes::from_owner(Self { bytes, _slot: slot })
+    }
+}
+
+impl AsRef<[u8]> for SdkPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 struct Reply {
@@ -472,6 +494,7 @@ impl External {
             task: config.task,
             targets,
             sessions: Mutex::new(HashMap::new()),
+            sdk_payload_slots: Arc::new(Semaphore::new(MAX_SDK_PAYLOADS)),
             anonymous_denials: Arc::default(),
         })
     }
@@ -685,16 +708,21 @@ impl External {
                     }
                 }
             };
-            let serve = http1::Builder::new().max_buf_size(16384).serve_connection(
-                TokioIo::new(tls),
-                service_fn(move |r| {
-                    let s = self.clone();
-                    let t = ticket.clone();
-                    let token = token.clone();
-                    let a = audit.clone();
-                    async move { Ok::<_, Infallible>(s.forward(r, &t, &token, &a).await) }
-                }),
-            );
+            // Keep the permit-backed payload queued until written. Flattening it
+            // into a per-connection buffer would release the permit too early.
+            let serve = http1::Builder::new()
+                .writev(true)
+                .max_buf_size(16384)
+                .serve_connection(
+                    TokioIo::new(tls),
+                    service_fn(move |r| {
+                        let s = self.clone();
+                        let t = ticket.clone();
+                        let token = token.clone();
+                        let a = audit.clone();
+                        async move { Ok::<_, Infallible>(s.forward(r, &t, &token, &a).await) }
+                    }),
+                );
             tokio::pin!(serve);
             tokio::select! {
                 _ = &mut serve => (),
@@ -754,6 +782,9 @@ impl External {
                 403,
             );
         }
+        let Ok(slot) = self.sdk_payload_slots.clone().try_acquire_owned() else {
+            return refused(audit, Some(issued), Some(&route.resource), "SDK 读取忙", 429);
+        };
         let accept = req.headers().get(header::ACCEPT).cloned();
         let details = format!(
             "任务 {}，SDK 会话 {}",
@@ -801,7 +832,7 @@ impl External {
         {
             return response(503, Bytes::new());
         }
-        let mut res = response(status, reply.body);
+        let mut res = response(status, SdkPayload::retain_slot(reply.body, slot));
         if let Some(mime) = reply.mime {
             res.headers_mut().insert(header::CONTENT_TYPE, mime);
         }
@@ -859,6 +890,23 @@ mod denial_tests {
     use super::*;
 
     #[test]
+    fn sdk_payload_budget_is_held_until_the_last_slice_is_dropped() -> Result<()> {
+        let slots = Arc::new(Semaphore::new(MAX_SDK_PAYLOADS));
+        let mut pending = Vec::new();
+        for _ in 0..MAX_SDK_PAYLOADS {
+            let slot = slots.clone().try_acquire_owned()?;
+            let payload = SdkPayload::retain_slot(Bytes::from_static(b"private fixture"), slot);
+            pending.push(payload.slice(5..));
+        }
+        assert!(slots.clone().try_acquire_owned().is_err());
+        pending.pop();
+        assert_eq!(slots.available_permits(), 1);
+        drop(pending);
+        assert_eq!(slots.available_permits(), MAX_SDK_PAYLOADS);
+        Ok(())
+    }
+
+    #[test]
     fn anonymous_events_share_one_window_and_authenticated_events_remain_individual() -> Result<()>
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -872,6 +920,7 @@ mod denial_tests {
             task: "test".into(),
             targets: HashMap::new(),
             sessions: Mutex::default(),
+            sdk_payload_slots: Arc::new(Semaphore::new(MAX_SDK_PAYLOADS)),
             anonymous_denials: Arc::default(),
         };
         assert_eq!(proxy.anonymous_refusal(&audit, "匿名", 407).status(), 407);
