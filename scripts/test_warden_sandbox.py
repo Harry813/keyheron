@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from run_warden_sandbox import CONTAINER_SOCKET, image_id, sandbox_args, task_socket
+from run_warden_sandbox import CONTAINER_SOCKET, image_id, main, sandbox_args, task_socket
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -24,10 +24,22 @@ class SandboxLauncherTests(unittest.TestCase):
             f"--mount=type=bind,src=/private/task.sock,dst={CONTAINER_SOCKET},readonly",
         ])
         for flag in ("--network=none", "--cap-drop=ALL", "--read-only", "--pull=never",
+                     "--memory=512m", "--memory-swap=512m", "--cpus=1", "--pids-limit=128",
                      "--security-opt=no-new-privileges=true"):
             self.assertIn(flag, argv[:argv.index(DIGEST)])
         with self.assertRaises(ValueError):
             sandbox_args("/private/task.sock", DIGEST, [])
+
+    def test_missing_resource_controller_stops_before_launch(self):
+        argv = ["sandbox", "--socket", "/unused", "--image", "agent", "--", "python3"]
+        with (patch.object(sys, "argv", argv), patch.object(sys, "platform", "linux"),
+              patch("run_warden_sandbox.task_socket"), patch("subprocess.run") as docker,
+              patch("sys.stderr"), self.assertRaises(SystemExit) as exited):
+            docker.return_value.stdout = "false\n"
+            main()
+        self.assertEqual(exited.exception.code, 1)
+        docker.assert_called_once()
+        self.assertIn("info", docker.call_args.args[0])
 
     def test_runs_exact_inspected_image_without_implicit_writable_volumes(self):
         self.assertEqual(image_id(f"{{}}\n{DIGEST}\n"), DIGEST)
@@ -76,6 +88,30 @@ assert not Path(sys.argv[1]).exists()
 assert not Path('/var/run/docker.sock').exists()
 assert not os.getenv('KEYHERON_OPERATOR_TEST_TOKEN')
 assert os.statvfs('/').f_flag & os.ST_RDONLY
+root = Path('/sys/fs/cgroup')
+groups = {}
+for entry in Path('/proc/self/cgroup').read_text().splitlines():
+    _, controllers, path = entry.split(':', 2)
+    for controller in controllers.split(','):
+        groups[controller] = path.lstrip('/')
+def own_group(controller):
+    mount = root / controller
+    group = mount / groups[controller]
+    # Docker can mount either the hierarchy or just this container's subtree.
+    return group if group.is_dir() else mount
+if (root / 'cgroup.controllers').exists():
+    group = own_group('')
+    assert int((group / 'memory.max').read_text()) == 512 * 1024**2
+    assert int((group / 'memory.swap.max').read_text()) == 0
+    quota, period = map(int, (group / 'cpu.max').read_text().split())
+else:
+    memory = own_group('memory')
+    cpu = own_group('cpu')
+    assert int((memory / 'memory.limit_in_bytes').read_text()) == 512 * 1024**2
+    assert int((memory / 'memory.memsw.limit_in_bytes').read_text()) == 512 * 1024**2
+    quota = int((cpu / 'cpu.cfs_quota_us').read_text())
+    period = int((cpu / 'cpu.cfs_period_us').read_text())
+assert quota == period and period > 0
 with socket.socket(socket.AF_UNIX) as client:
     client.connect(os.environ['KEYHERON_WARDEN_SOCKET'])
     client.sendall(b'task')
