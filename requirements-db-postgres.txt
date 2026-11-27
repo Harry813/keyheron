@@ -1,0 +1,2 @@
+# Optional SCRAM authentication for the PostgreSQL broker.
+scramp==1.5.0

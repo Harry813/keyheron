@@ -1,5 +1,8 @@
 //! A single-task, deny-by-default credential broker for explicitly configured HTTPS endpoints.
-use crate::audit::Audit;
+use crate::{
+    audit::Audit,
+    vault::{Binding, MAX_CREDENTIAL},
+};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use http_body_util::Full;
@@ -27,6 +30,7 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const DENIAL_WINDOW: Duration = Duration::from_secs(30);
@@ -42,7 +46,10 @@ pub struct ExternalConfig {
 #[serde(deny_unknown_fields)]
 pub struct ExternalEnvironment {
     pub origin: String,
+    #[serde(default)]
     pub credential_files: HashMap<String, PathBuf>,
+    #[serde(default)]
+    pub credential_bindings: HashMap<String, Binding>,
     pub routes: HashMap<String, Route>,
     pub ca_file: Option<PathBuf>,
     pub proxy_cert_file: PathBuf,
@@ -117,7 +124,14 @@ enum ResponseUse {
 }
 
 impl Target {
-    fn new(config: ExternalEnvironment) -> Result<Self> {
+    fn new(environment: &str, config: ExternalEnvironment) -> Result<Self> {
+        for (alias, binding) in &config.credential_bindings {
+            ensure!(
+                !config.credential_files.contains_key(alias),
+                "每个凭据别名只能使用一种来源"
+            );
+            binding.validate(environment)?;
+        }
         let origin = Url::parse(&config.origin).context("无效的 HTTPS 服务地址")?;
         ensure!(
             origin.scheme() == "https"
@@ -156,7 +170,8 @@ impl Target {
                 "路由只支持固定的规范路径，不支持通配符、编码、查询或片段"
             );
             ensure!(
-                config.credential_files.contains_key(&route.credential),
+                config.credential_files.contains_key(&route.credential)
+                    || config.credential_bindings.contains_key(&route.credential),
                 "路由引用了未声明的凭据"
             );
             let name = header::HeaderName::from_bytes(route.auth_header.as_bytes())
@@ -233,17 +248,17 @@ impl Target {
         })
     }
 
-    async fn fetch(
-        &self,
-        kind: &str,
-        op: Option<&str>,
-        response_use: ResponseUse,
-    ) -> Result<Reply> {
-        let route = self.config.routes.get(kind).context("环境未配置此动作")?;
+    async fn credential(&self, alias: &str) -> Result<Zeroizing<Vec<u8>>> {
+        if let Some(binding) = self.config.credential_bindings.get(alias) {
+            let binding = binding.clone();
+            return tokio::task::spawn_blocking(move || binding.read())
+                .await
+                .map_err(|_| anyhow!("加密凭据读取失败"))?;
+        }
         let file = self
             .config
             .credential_files
-            .get(&route.credential)
+            .get(alias)
             .context("凭据引用无效")?;
         // A rotation changes the next request. Never place the value in logs, URLs or user responses.
         let mut options = tokio::fs::OpenOptions::new();
@@ -255,14 +270,25 @@ impl Target {
             handle.metadata().await?.is_file(),
             "该环境凭据必须是普通文件"
         );
-        let mut raw = Vec::new();
+        let mut raw = Zeroizing::new(Vec::new());
         use tokio::io::AsyncReadExt;
         (&mut handle)
-            .take(16385)
+            .take(MAX_CREDENTIAL as u64 + 1)
             .read_to_end(&mut raw)
             .await
             .context("无法读取凭据")?;
-        ensure!(raw.len() <= 16384, "凭据文件超出限制");
+        ensure!(raw.len() <= MAX_CREDENTIAL, "凭据文件超出限制");
+        Ok(raw)
+    }
+
+    async fn fetch(
+        &self,
+        kind: &str,
+        op: Option<&str>,
+        response_use: ResponseUse,
+    ) -> Result<Reply> {
+        let route = self.config.routes.get(kind).context("环境未配置此动作")?;
+        let raw = self.credential(&route.credential).await?;
         let secret = std::str::from_utf8(&raw)
             .context("凭据格式无效")?
             .trim_end_matches(['\r', '\n']);
@@ -375,7 +401,8 @@ impl External {
         let mut targets = HashMap::new();
         for (env, cfg) in config.environments {
             ensure!(matches!(env.as_str(), "DEV" | "STG" | "PROD"), "未知环境");
-            targets.insert(env, Target::new(cfg)?);
+            let target = Target::new(&env, cfg)?;
+            targets.insert(env, target);
         }
         Ok(Self {
             task: config.task,

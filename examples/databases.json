@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "task": "database-investigation",
+  "credential_store": {"path": "vault/credentials.sqlite3"},
+  "identities": {"applicant": "analyst", "approver": "owner"},
+  "environments": {
+    "DEV": {
+      "databases": {
+        "orders-pg": {
+          "engine": "postgresql",
+          "host": "pg.dev.example.com",
+          "database": "orders",
+          "user": "orders_reader",
+          "password_ref": "pg-reader",
+          "max_ttl": 300
+        },
+        "orders-mysql": {
+          "engine": "mysql",
+          "host": "mysql.dev.example.com",
+          "database": "orders",
+          "user": "orders_reader",
+          "password_ref": "mysql-reader"
+        },
+        "orders-sqlserver": {
+          "engine": "sqlserver",
+          "host": "sql.dev.example.com",
+          "database": "Orders",
+          "user": "orders_reader",
+          "password_ref": "sqlserver-reader"
+        }
+      }
+    }
+  }
+}

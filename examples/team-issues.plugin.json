@@ -1,0 +1,6 @@
+{
+  "api_version": 1,
+  "id": "team-issues",
+  "action": "read",
+  "driver": "https-json"
+}

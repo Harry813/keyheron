@@ -19,6 +19,9 @@ ROOT_FILES = {
     "access.py", "agent_access.py", "keyheron.py", "bench.py", "console.py", "demo.py", "guard.py",
     "runtime.py", "tools.py", "verify.py", "verify_external.py", "verify_web.py", "web_demo.py",
     "打开工作台.command", "performance.json", "verification.json", "web-verification.json",
+    "requirements-db-postgres.txt", "requirements-credentials.txt", "credential_store.py", "secret_cli.py",
+    "warden.py", "warden_client.py", "warden_control.py", "warden_plugins.py", "warden_admin.py",
+    "warden_storage.py", "plugin_runtime.py",
 }
 NATIVE = ("keyheron-core-darwin-arm64", "keyheron-core-linux-amd64")
 PENDING = (
@@ -30,7 +33,8 @@ PENDING = (
 def selected(name):
     if name in ROOT_FILES or name in {
         "rust-core/Cargo.toml", "rust-core/Cargo.lock", "web/LICENSE", "web/NOTICE",
-        "examples/github-readonly.json", "examples/read_resource.py", "docs/workbench.png",
+        "examples/github-readonly.json", "examples/read_resource.py", "examples/databases.json", "docs/workbench.png",
+        "examples/warden-policy.json", "examples/warden-plugins.json", "examples/team-issues.plugin.json",
     }:
         return True
     path = Path(name)
@@ -38,7 +42,7 @@ def selected(name):
         return False
     suffixes = {
         ".github/workflows": {".yml"}, "docs": {".md"}, "scripts": {".py"},
-        "rust-core/src": {".rs"},
+        "rust-core/src": {".rs"}, "rust-core/examples": {".rs"}, "dbproxy": {".py"},
         "third_party": {".txt"}, "web": {".html", ".css", ".js", ".md"},
     }
     return any(name.startswith(prefix + "/") and path.suffix in ext for prefix, ext in suffixes.items())
@@ -113,7 +117,8 @@ def validate(files, release):
     if release:
         required.update({"LICENSE", "CONTRIBUTING.md", "SECURITY.md", "verify_external.py", "agent_access.py", "keyheron.py",
                          "examples/github-readonly.json", "examples/read_resource.py", "docs/QUICKSTART.md",
-                         "scripts/verify_github.py"})
+                         "scripts/verify_github.py", "credential_store.py", "secret_cli.py",
+                         "requirements-credentials.txt", "docs/CREDENTIALS.md"})
     missing = sorted(required - files.keys())
     if missing:
         raise ValueError("missing required source files: " + ", ".join(missing))

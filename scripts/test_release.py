@@ -7,10 +7,27 @@ import tempfile
 import unittest
 from zipfile import ZipFile
 
-from package_release import NATIVE, ROOT, build
+from package_release import NATIVE, ROOT, build, selected
 
 
 class ReleasePackage(unittest.TestCase):
+    def test_native_database_client_files_ship_in_source(self):
+        for name in ("dbproxy/__init__.py", "dbproxy/session.py", "dbproxy/mysql.py",
+                     "dbproxy/postgresql.py", "dbproxy/sqlserver.py", "requirements-db-postgres.txt",
+                     "examples/databases.json", "docs/DATABASES.md", "credential_store.py", "secret_cli.py",
+                     "requirements-credentials.txt", "docs/CREDENTIALS.md",
+                     "warden.py", "warden_client.py", "warden_control.py", "warden_plugins.py", "warden_admin.py",
+                     "examples/warden-policy.json", "examples/warden-plugins.json", "docs/WARDEN.md",
+                     "plugin_runtime.py", "warden_storage.py", "examples/team-issues.plugin.json", "docs/PLUGIN-API.md",
+                     "rust-core/examples/issue_reader.rs", "rust-core/src/lib.rs", "rust-core/src/plugins.rs",
+                     "rust-core/src/plugin_command.rs", "rust-core/src/gitlab_plugin.rs",
+                     "dbproxy/native_relay.py", "rust-core/src/db_relay.rs",
+                     "web/warden-admin.html", "web/warden-admin.js", "web/warden-admin.css",
+                     "scripts/run_warden_sandbox.py"):
+            with self.subTest(name=name):
+                self.assertTrue(selected(name))
+                self.assertTrue((ROOT / name).is_file())
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="keyheron-release-test-")
         self.addCleanup(temp.cleanup)
@@ -21,7 +38,8 @@ class ReleasePackage(unittest.TestCase):
             "README.md", "CONTRIBUTING.md", "SECURITY.md", "web/app.js", "web/index.html", "web/styles.css",
             "rust-core/src/main.rs", "rust-core/Cargo.lock", "agent_access.py", "keyheron.py", "verify_external.py",
             "examples/github-readonly.json", "examples/read_resource.py", "docs/QUICKSTART.md", "scripts/verify_github.py",
-            "third_party/RUST-NOTICES.txt",
+            "third_party/RUST-NOTICES.txt", "credential_store.py", "secret_cli.py",
+            "requirements-credentials.txt", "docs/CREDENTIALS.md",
         ):
             self.put(name, "fixture\n")
         self.put("rust-core/Cargo.toml", '[package]\nversion = "0.1.0"\n')

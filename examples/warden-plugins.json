@@ -1,0 +1,19 @@
+{
+  "gitlab": {
+    "mr-42": {
+      "origin": "https://gitlab.example.com",
+      "project": 17,
+      "iid": 42,
+      "token_file": "secrets/gitlab-reader.token"
+    }
+  },
+  "postgresql": {
+    "orders": {"config": "databases.json", "env": "DEV", "target": "orders-pg"}
+  },
+  "mysql": {
+    "orders": {"config": "databases.json", "env": "DEV", "target": "orders-mysql"}
+  },
+  "sqlserver": {
+    "orders": {"config": "databases.json", "env": "DEV", "target": "orders-sqlserver"}
+  }
+}

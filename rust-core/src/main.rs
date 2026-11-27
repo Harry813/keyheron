@@ -1,7 +1,11 @@
 mod audit;
+mod db_relay;
 mod external;
+mod gitlab_plugin;
+mod plugin_command;
 mod service;
 mod transport;
+mod vault;
 
 use anyhow::{ensure, Context, Result};
 use axum::{
@@ -199,16 +203,34 @@ mod control_tests {
     }
 }
 
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 1 {
+        return run_service();
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    match args[1].as_str() {
+        "plugins-v1" if args.len() == 2 => {
+            runtime.block_on(plugin_command::run());
+            Ok(())
+        }
+        "db-relay" => runtime.block_on(db_relay::run(&args[2..])),
+        _ => anyhow::bail!("未知核心命令"),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cfg: Config = serde_json::from_str(
-        &std::io::stdin()
-            .lock()
-            .lines()
-            .next()
-            .context("需要启动器提供配置")??,
-    )
-    .context("配置格式有误")?;
+async fn run_service() -> Result<()> {
+    let cfg: Config = {
+        let startup = zeroize::Zeroizing::new(
+            std::io::stdin()
+                .lock()
+                .lines()
+                .next()
+                .context("需要启动器提供配置")??,
+        );
+        serde_json::from_str(&startup).context("配置格式有误")?
+    };
     ensure!(cfg.listen.ip().is_loopback(), "请绑定回环地址");
     ensure!(
         cfg.alice.len() >= 24 && cfg.owner.len() >= 24 && cfg.alice != cfg.owner,

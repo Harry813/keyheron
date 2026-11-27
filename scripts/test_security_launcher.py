@@ -70,7 +70,8 @@ class SecurityLauncher(unittest.TestCase):
             logical.symlink_to("first")
             policy = json.loads((ROOT / "examples/github-readonly.json").read_text())
             policy["environments"] = {"DEV": policy["environments"]["DEV"]}
-            policy["environments"]["DEV"]["credential_files"]["github-reader"] = "active"
+            del policy["environments"]["DEV"]["credential_refs"]
+            policy["environments"]["DEV"]["credential_files"] = {"github-reader": "active"}
             config = root / "policy.json"
             config.write_text(json.dumps(policy))
             path = Path(load_config(config)["environments"]["DEV"]["credential_files"]["github-reader"])
@@ -84,7 +85,8 @@ class SecurityLauncher(unittest.TestCase):
             root = Path(directory)
             policy = json.loads((ROOT / "examples/github-readonly.json").read_text())
             env = policy["environments"]["DEV"]
-            env["credential_files"]["github-reader"] = "reader"
+            del env["credential_refs"]
+            env["credential_files"] = {"github-reader": "reader"}
             env["ca_file"] = "ca.pem"
             policy["environments"] = {"DEV": env}
             for version in ("first", "second"):

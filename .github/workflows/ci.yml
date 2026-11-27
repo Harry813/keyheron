@@ -61,8 +61,26 @@ jobs:
           python3 scripts/test_security_launcher.py
           python3 scripts/test_security_state.py
           python3 scripts/test_security_limits.py
+          python3 -m pip install -r requirements-db-postgres.txt -r requirements-credentials.txt
+          python3 scripts/test_credential_store.py
+          python3 scripts/test_secret_cli.py
+          python3 scripts/verify_https_vault.py
+          python3 -m unittest discover -s scripts -p 'test_db_*.py'
+          node --check web/warden-admin.js
+          python3 -m unittest discover -s scripts -p 'test_warden_*.py'
+          python3 scripts/test_plugin_api.py
           python3 bench.py --samples 24 --concurrency 1 4 --warmup 2 --json
           python3 scripts/test_release.py
+      - name: Verify native psql against a temporary TLS-enabled PostgreSQL instance
+        if: runner.os == 'Linux'
+        run: python3 scripts/verify_db_postgres.py
+      - name: Verify the task socket inside an isolated Linux container
+        if: runner.os == 'Linux'
+        env:
+          KEYHERON_SANDBOX_TEST_IMAGE: python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
+        run: |
+          docker pull "$KEYHERON_SANDBOX_TEST_IMAGE"
+          python3 scripts/test_warden_sandbox.py SandboxLauncherTests.test_real_agent_can_only_reach_task_socket
       - name: Verify redistribution notices against the complete locked dependency graph
         if: runner.os == 'Linux'
         run: python3 scripts/rust_notices.py --check

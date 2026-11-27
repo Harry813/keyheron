@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>连接器授权 · 青鹭</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/warden-admin.css">
+  <script src="/warden-admin.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#content">跳至内容</a>
+  <main id="content">
+    <header class="page-head">
+      <div><p>青鹭 · 本地管理</p><h1>连接器授权</h1></div>
+      <button type="button" class="button secondary" id="refresh">刷新</button>
+    </header>
+    <p id="message" role="status" aria-live="polite">正在连接管理服务…</p>
+    <section class="panel" aria-labelledby="template-title">
+      <h2 id="template-title">基础模板</h2>
+      <ul id="templates"></ul>
+      <form id="template-form" aria-labelledby="new-title">
+        <h3 id="new-title">创建模板</h3>
+        <label for="name">模板名称</label>
+        <input id="name" maxlength="128" placeholder="review-v1" required>
+        <div id="rules"></div>
+        <div class="actions">
+          <button id="add-rule" class="button secondary" type="button">添加规则</button>
+          <button id="save-template" class="button primary" type="submit" disabled>创建模板</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel" aria-labelledby="binding-title">
+      <h2 id="binding-title">任务授权</h2>
+      <ul id="bindings"></ul>
+      <form id="bind-form" aria-labelledby="apply-title">
+        <h3 id="apply-title">应用模板</h3>
+        <div class="fields">
+          <div><label for="warden">Warden</label><select id="warden" required></select></div>
+          <div><label for="task">任务名称</label><input id="task" maxlength="128" required></div>
+          <div><label for="binding-template">模板</label><select id="binding-template" required></select></div>
+        </div>
+        <button id="apply-template" type="submit" class="button primary" disabled>应用到任务</button>
+      </form>
+    </section>
+    <section class="panel" aria-labelledby="audit-title">
+      <h2 id="audit-title">最近 100 条审计事件</h2>
+      <div class="table-wrap" tabindex="0" role="region" aria-labelledby="audit-title">
+        <table>
+          <thead><tr><th scope="col">时间（UTC）</th><th scope="col">Warden / 任务</th><th scope="col">连接器 / 动作</th><th scope="col">资源</th><th scope="col">事件</th><th scope="col">结果</th></tr></thead>
+          <tbody id="events"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <template id="rule-row">
+    <fieldset><legend></legend>
+      <div class="fields">
+        <div><label>连接器操作</label><select data-field="connector" required></select></div>
+        <div><label>资源标识</label><input data-field="resource" maxlength="128" required></div>
+        <div><label>有效期（秒）</label><input data-field="ttl" type="number" min="1" max="900" value="30" required></div>
+        <button type="button" class="button secondary minor">移除规则</button>
+      </div>
+    </fieldset>
+  </template>
+</body>
+</html>

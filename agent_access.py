@@ -1,4 +1,4 @@
-"""KeyHeron developer preview: trusted launcher for configured HTTPS services."""
+"""KeyHeron developer preview: trusted launcher for HTTPS and database sessions."""
 
 import argparse
 from contextlib import contextmanager, suppress
@@ -39,15 +39,22 @@ def _file(base, value, *, rotating=False):
     return str(path if rotating else path.resolve(strict=True))
 
 
-def load_config(path):
+def load_config(path, *, database=False, read_json=None):
     """Only the trusted operator provides the configuration and its secret-file references."""
     logical_path = Path(path).absolute()
     path = logical_path.resolve(strict=True)
-    data = json.loads(path.read_text())
+    data = read_json(logical_path) if read_json else json.loads(path.read_text())
     fields = {"version", "task", "identities", "environments"}
-    _checked_fields(data, fields, fields)
+    _checked_fields(data, fields | {"credential_store"}, fields)
     if type(data["version"]) is not int or data["version"] != 1:
         raise ValueError("仅支持配置 version=1")
+    if "credential_store" in data:
+        store = data["credential_store"]
+        _checked_fields(store, {"path", "passphrase_file"}, {"path"})
+        for field, value in store.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("凭据库配置需要非空文件路径")
+            store[field] = str(logical_path.parent / value)
 
     def label(value):
         return (
@@ -67,9 +74,23 @@ def load_config(path):
     envs = data["environments"]
     if not isinstance(envs, dict) or not envs or set(envs) - {"DEV", "STG", "PROD"}:
         raise ValueError("需要至少一个 DEV、STG 或 PROD 环境")
-    for name, env in envs.items():
-        mandatory = {"origin", "credential_files", "routes"}
-        _checked_fields(env, mandatory | {"ca_file"}, mandatory)
+    selected = {}
+    for name, raw in envs.items():
+        mandatory = {"origin", "routes"}
+        https_fields = mandatory | {"ca_file", "credential_files", "credential_refs"}
+        _checked_fields(raw, https_fields | {"databases"}, set())
+        env = {k: v for k, v in raw.items() if k != "databases"}
+        if not env and "databases" not in raw:
+            raise ValueError(f"{name} 缺少 HTTPS 服务或数据库")
+        if env:
+            _checked_fields(env, https_fields, mandatory)
+        if database:
+            if "databases" in raw:
+                from dbproxy import targets
+                selected[name] = targets(raw["databases"], logical_path.parent)
+            continue
+        if not env:
+            continue
         origin = urlsplit(env["origin"])
         if (
             origin.scheme != "https"
@@ -86,14 +107,43 @@ def load_config(path):
             )
         if not isinstance(env["routes"], dict) or "read" not in env["routes"]:
             raise ValueError(f"{name} 缺少只读路由")
-        if not isinstance(env["credential_files"], dict) or not env["credential_files"]:
+        files = env.get("credential_files", {})
+        refs = env.get("credential_refs", {})
+        if not isinstance(files, dict) or not isinstance(refs, dict) or not (files or refs):
             raise ValueError(f"{name} 缺少凭据引用")
+        if files.keys() & refs.keys():
+            raise ValueError(f"{name} 的同一凭据只能使用一个来源")
+        if refs and "credential_store" not in data:
+            raise ValueError(f"{name} 的加密凭据需要配置 credential_store")
         env["credential_files"] = {
-            k: _file(logical_path.parent, v, rotating=True) for k, v in env["credential_files"].items()
+            k: _file(logical_path.parent, v, rotating=True) for k, v in files.items()
         }
         if env.get("ca_file"):
             env["ca_file"] = _file(path.parent, env["ca_file"])
+        selected[name] = env
+    if not selected:
+        raise ValueError("策略中没有数据库连接" if database else "策略中没有 HTTPS 服务；数据库连接请使用 db 命令")
+    data["environments"] = selected
     return data
+
+
+def unlock_policy_store(policy):
+    settings = policy.get("credential_store")
+    if settings is None:
+        raise ValueError("加密凭据需要配置 credential_store")
+    from credential_store import unlock
+    from secret_cli import load_passphrase
+    return unlock(settings["path"], load_passphrase(settings.get("passphrase_file")))
+
+
+def bind_https_credentials(policy):
+    store = None
+    for name, env in policy["environments"].items():
+        refs = env.pop("credential_refs", {})
+        if refs:
+            if store is None:
+                store = unlock_policy_store(policy)
+            env["credential_bindings"] = {alias: store.binding(name, ref) for alias, ref in refs.items()}
 
 
 def _openssl(*args):
@@ -201,6 +251,7 @@ def running_external(
     ):
         working = Path(tmp)
         envs = data["environments"]
+        bind_https_credentials(data)
         ca = proxy_certs(working, envs)
         alice, owner = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         cfg = {
@@ -226,6 +277,8 @@ def running_external(
         try:
             process.stdin.write(json.dumps(cfg) + "\n")
             process.stdin.flush()
+            for env in envs.values():
+                env.pop("credential_bindings", None)
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ)
                 if not selector.select(15):
@@ -368,8 +421,24 @@ def run_child(info, env, command):
 
 
 def main():
+    import secret_cli
+    import warden_client
+    import warden_control
     parser = argparse.ArgumentParser(prog="keyheron", description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
+    secret_cli.register(sub)
+    warden_control.add_server_arguments(sub.add_parser("warden-server", help="启动 mTLS 连接器授权服务"))
+    admin = sub.add_parser("warden-admin", help="打开本地连接器模板和审计工作台")
+    from warden_admin import add_arguments as add_admin_arguments
+    add_admin_arguments(admin)
+    worker = sub.add_parser("warden", help="为一个任务启动受信连接器进程")
+    worker.add_argument("--task", required=True)
+    worker.add_argument("--server", required=True)
+    from plugin_runtime import add_runtime_arguments
+    add_runtime_arguments(worker)
+    for flag in ("ca", "cert", "key", "plugins", "state-dir"):
+        worker.add_argument("--" + flag, required=True, type=Path)
+    warden_client.add_arguments(sub.add_parser("connector", help="通过本任务的 Warden 使用已授权连接器"))
     serve = sub.add_parser("serve", help="启动已配置的 HTTPS 工作台和凭据代理")
     serve.add_argument("--config", type=Path, required=True)
     serve.add_argument("--core", type=Path)
@@ -378,9 +447,36 @@ def main():
     run = sub.add_parser("run", help="运行一次具有指定环境只读权限的客户端")
     run.add_argument("--env", choices=["DEV", "STG", "PROD"], required=True)
     run.add_argument("command", nargs=argparse.REMAINDER)
+    db = sub.add_parser("db", help="为原生 SQL 客户端开启一个限时本地连接")
+    db.add_argument("--config", type=Path, required=True)
+    db.add_argument("--env", choices=["DEV", "STG", "PROD"], required=True)
+    db.add_argument("--target", required=True, help="管理员在该环境配置的数据库别名")
+    db.add_argument("--ttl", type=int, help="会话秒数，默认使用目标策略上限")
+    db.add_argument("--state-dir", type=Path, default=Path(".keyheron-db"))
     for p in (serve, run):
         p.add_argument("--state-dir", type=Path, default=Path(".keyheron"))
     args = parser.parse_args()
+    if args.action == "warden-server":
+        return warden_control.serve(args)
+    if args.action == "warden-admin":
+        from warden_admin import serve as serve_admin
+        return serve_admin(args)
+    if args.action in ("warden", "connector"):
+        if sys.version_info < (3, 11):
+            raise RuntimeError("Warden 和沙箱连接器客户端需要 Python 3.11 或更新版本")
+        import asyncio
+        if args.action == "warden":
+            import warden
+            return asyncio.run(warden.serve(args))
+        return asyncio.run(warden_client.run(args))
+    if args.action == "secrets":
+        return secret_cli.run(args)
+    if args.action == "db":
+        if sys.version_info < (3, 11):
+            raise RuntimeError("原生数据库连接需要 Python 3.11 或更新版本")
+        from dbproxy.session import serve_database
+        import asyncio
+        return asyncio.run(serve_database(load_config(args.config, database=True), args))
     if args.action == "run":
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         descriptor = args.state_dir / "client.json"

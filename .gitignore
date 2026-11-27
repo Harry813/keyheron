@@ -13,6 +13,7 @@ local.config.json
 *.token
 /examples/secrets/
 client.json
+**/session-*/connection.json
 /.venv/
 __pycache__/
 *.py[cod]

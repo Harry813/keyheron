@@ -9,7 +9,7 @@
 ## 接入你的私有 GitHub 测试仓
 
 1. 将 `examples/github-readonly.json` 复制到仓库之外的私有目录并重命名为 `policy.json`。把两个示例路径替换成你有权读取的实际仓库。只用一个环境时，可以删除另一个环境段。
-2. 给每个环境准备独立的只读凭据，限制到该环境的测试仓库和 Contents: read。分别保存在配置旁的 `secrets/dev-reader` 和 `secrets/stg-reader`，私有目录使用 0700、凭据文件使用 0600。也可以使用已有密钥管理器为宿主提供的文件路径。不要把值写进配置或粘贴到终端命令行。
+2. 给每个环境准备独立的只读凭据，限制到该环境的测试仓库和 Contents: read。在配置旁初始化 `vault/credentials.sqlite3`，用 `secrets put` 分别向 DEV 和 STG 录入名为 `github-reader` 的凭据。程序会在终端关闭回显。[凭据库操作说明](CREDENTIALS.md)
 3. 打开两个终端，在第一个启动服务，在第二个启动你的客户端。以下示例都从项目根目录运行；替换配置路径。
 
 ```sh
@@ -30,14 +30,14 @@ python3 keyheron.py run --state-dir .keyheron --env STG -- python3 examples/read
 | 字段 | 用途 |
 |---|---|
 | `origin` | HTTPS 主机，可带端口，不带路径、查询或账户信息。 |
-| `credential_files` | 从凭据引用映射到文件。即使多个环境共用同一主机，也应给每个环境配置独立凭据与资源。 |
+| `credential_refs` | 从路由的凭据引用映射到同一环境的加密条目名。旧版 `credential_files` 可以继续引用由宿主管理的文件。同一引用只能配置一个来源。 |
 | `ca_file` | 可选的额外上游 CA，仅在该环境生效。默认验证正常的公共受信证书。 |
 | `routes.read` | 要求固定 GET 路径；是通用 SDK 唯一可使用的动作。 |
 | `routes.diagnose` | 可选的限时受管 GET；需独立审批。 |
 | `routes.retry` | 可选的单次受管 POST；需独立审批。只有上游实际支持 Idempotency-Key 才应设 `idempotency_supported: true`。 |
 | 各路由通用字段 | `method`、`path`、`resource`、`credential`，可选 `max_ttl`（1–900 秒）。默认注入 Authorization: Bearer；自定义 API Key 可用 `auth_header: "X-API-Key"`、`auth_scheme: ""`。 |
 
-例如，下面两个条目可以放入某个环境的 `routes`。凭据引用必须在该环境的 `credential_files` 中声明。上游地址、动作和参数由可信维护者配置，客户端不能自行改写。
+例如，下面两个条目可以放入某个环境的 `routes`。凭据引用必须在该环境的 `credential_refs` 或 `credential_files` 中声明。上游地址、动作和参数由可信维护者配置，客户端不能自行改写。
 
 ```json
 {

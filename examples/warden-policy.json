@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "templates": {
+    "mr-review-v1": [
+      {"connector": "gitlab", "action": "read", "resource": "mr-42", "ttl": 30}
+    ],
+    "orders-postgresql-v1": [
+      {"connector": "postgresql", "action": "connect", "resource": "orders", "ttl": 120}
+    ],
+    "orders-mysql-v1": [
+      {"connector": "mysql", "action": "connect", "resource": "orders", "ttl": 120}
+    ]
+  },
+  "wardens": {
+    "spiffe://keyheron/warden/demo": {
+      "tasks": {"review-001": {"template": "mr-review-v1"}}
+    }
+  }
+}
